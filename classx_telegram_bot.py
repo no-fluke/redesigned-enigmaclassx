@@ -827,6 +827,18 @@ async def conv_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("_del_apis", None)
     # Also clear selection state
     user_state.pop(update.effective_chat.id, None)
+
+    cmd = update.message.text.strip().lstrip("/").split()[0].lower() if update.message.text else ""
+
+    # If the user sent /sites while inside a wizard, silently exit the wizard
+    # and immediately run the /sites flow instead of showing "Cancelled."
+    if cmd == "sites":
+        return await cmd_sites.__wrapped__(update, ctx) if hasattr(cmd_sites, "__wrapped__") else await cmd_sites(update, ctx)
+    if cmd == "deleteapi":
+        return await cmd_deleteapi.__wrapped__(update, ctx) if hasattr(cmd_deleteapi, "__wrapped__") else await cmd_deleteapi(update, ctx)
+    if cmd == "addapi":
+        return await addapi_start.__wrapped__(update, ctx) if hasattr(addapi_start, "__wrapped__") else await addapi_start(update, ctx)
+
     await update.message.reply_text("❌ Cancelled.")
     return ConversationHandler.END
 
@@ -835,8 +847,10 @@ async def conv_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_sites(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    # Clear any previous state for this user
+    # Clear any previous selection state and wizard data for this user
     user_state.pop(chat_id, None)
+    ctx.user_data.pop("_new_api", None)
+    ctx.user_data.pop("_del_apis", None)
 
     try:
         apis = load_all_apis()
@@ -1206,7 +1220,11 @@ async def main():
             ADD_USER_ID:    [MessageHandler(filters.TEXT & ~filters.COMMAND, addapi_user_id)],
             ADD_AUTH_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, addapi_auth_token)],
         },
-        fallbacks=[CommandHandler("cancel", conv_cancel)],
+        fallbacks=[
+            CommandHandler("cancel",    conv_cancel),
+            CommandHandler("sites",     conv_cancel),   # /sites exits the wizard
+            CommandHandler("deleteapi", conv_cancel),   # /deleteapi exits the wizard
+        ],
     )
 
     # /deleteapi wizard
@@ -1215,7 +1233,11 @@ async def main():
         states={
             DEL_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, del_confirm)],
         },
-        fallbacks=[CommandHandler("cancel", conv_cancel)],
+        fallbacks=[
+            CommandHandler("cancel",  conv_cancel),
+            CommandHandler("sites",   conv_cancel),   # /sites exits the wizard
+            CommandHandler("addapi",  conv_cancel),   # /addapi exits the wizard
+        ],
     )
 
     app.add_handler(CommandHandler("start",     cmd_start))
