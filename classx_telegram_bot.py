@@ -4,7 +4,7 @@ ClassX Multi-Site Test Series Scraper — Telegram Bot (v2)
 
 NEW in v2:
   • MongoDB backend  — site/API profiles are stored in MongoDB, not hardcoded.
-  • /addapi command  — add a new ClassX site via the bot (step-by-step conversation).
+  • /addapi command  — add a new ClassX site by pasting the API URL (1 step).
   • /listapis        — list all saved APIs from DB.
   • /deleteapi       — remove an API by number.
   • Numbered selection flow (NO inline buttons for scraping):
@@ -19,38 +19,23 @@ NEW in v2:
               → bot scrapes each selected quiz and sends a separate JSON file per quiz
 
 INSTALL:
-  pip install python-telegram-bot pymongo requests
+  pip install python-telegram-bot pymongo requests aiohttp
 
 MONGODB:
   Set MONGO_URI below (e.g. "mongodb://localhost:27017" or Atlas URI).
   The bot uses database "classxbot", collection "apis".
 
-  Each document shape:
-  {
-    "key":         "parmar",           # unique short key
-    "label":       "Parmar Academy",
-    "base_url":    "https://parmaracademyapi.classx.co.in",
-    "origin":      "https://www.parmaracademy.in",
-    "referer":     "https://www.parmaracademy.in/",
-    "user_id":     "391142",
-    "auth_token":  "eyJ...",
-    "output_name": "parmar_academy_data.json"
-  }
-
-  On first run the 5 built-in sites are seeded automatically if the collection
-  is empty. You can delete them via /deleteapi if you want.
-
 BOT SETUP:
   1. Get a token from @BotFather → set BOT_TOKEN below.
   2. Set MONGO_URI.
-  3. pip install python-telegram-bot pymongo requests
-  4. python classx_telegram_bot.py
+  3. pip install python-telegram-bot pymongo requests aiohttp
+  4. python classx_bot.py
 
 COMMANDS:
   /start        — Welcome
   /help         — Full help text
   /sites        — Pick a site (numbered list)
-  /addapi       — Start add-API wizard (multi-step conversation)
+  /addapi       — Paste a ClassX API URL to add it (1 step)
   /listapis     — Show all saved APIs
   /deleteapi    — Delete an API by number
   /cancel       — Cancel any running wizard or scrape
@@ -62,15 +47,14 @@ import logging
 import os
 import re
 import time
-from copy import deepcopy
 from datetime import datetime
 from io import BytesIO
+from urllib.parse import urlparse
 
 import aiohttp
 from aiohttp import web
 import requests
 from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -83,13 +67,13 @@ from telegram.ext import (
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-BOT_TOKEN   = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-MONGO_URI   = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
-PORT        = int(os.environ.get("PORT", "8080"))
-RENDER_URL  = os.environ.get("RENDER_EXTERNAL_URL", "")  # injected by Render automatically
+BOT_TOKEN      = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+MONGO_URI      = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
+PORT           = int(os.environ.get("PORT", "8080"))
+RENDER_URL     = os.environ.get("RENDER_EXTERNAL_URL", "")
 
-DELAY       = 0.5   # seconds between ClassX API requests
-PING_INTERVAL = 4 * 60  # self-ping every 4 minutes
+DELAY          = 0.5        # seconds between ClassX API requests
+PING_INTERVAL  = 4 * 60    # self-ping every 4 minutes
 
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
 
@@ -101,8 +85,8 @@ logger = logging.getLogger(__name__)
 
 # ─── MONGODB ──────────────────────────────────────────────────────────────────
 
-_mongo_client: MongoClient | None = None
-_apis_col = None   # collection handle
+_mongo_client = None
+_apis_col     = None
 
 
 def get_apis_col():
@@ -110,24 +94,21 @@ def get_apis_col():
     if _apis_col is not None:
         return _apis_col
     _mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-    # Ping to verify connection
     _mongo_client.admin.command("ping")
-    db = _mongo_client["classxbot"]
+    db        = _mongo_client["classxbot"]
     _apis_col = db["apis"]
-    # Seed built-in sites only if collection is empty
     if _apis_col.count_documents({}) == 0:
         _apis_col.insert_many(BUILTIN_SITES)
         logger.info("Seeded %d built-in sites into MongoDB.", len(BUILTIN_SITES))
     return _apis_col
 
 
-def load_all_apis() -> list[dict]:
-    """Return all API profiles from MongoDB as a list (sorted by label)."""
+def load_all_apis() -> list:
     col = get_apis_col()
     return list(col.find({}, {"_id": 0}).sort("label", 1))
 
 
-def get_api_by_key(key: str) -> dict | None:
+def get_api_by_key(key: str):
     col = get_apis_col()
     return col.find_one({"key": key}, {"_id": 0})
 
@@ -141,7 +122,6 @@ def delete_api(key: str) -> bool:
     col = get_apis_col()
     result = col.delete_one({"key": key})
     return result.deleted_count > 0
-
 
 # ─── BUILT-IN SEED DATA ───────────────────────────────────────────────────────
 
@@ -243,37 +223,200 @@ BUILTIN_SITES = [
     },
 ]
 
-# ─── SCRAPER CLASS  (all extractor functions identical to original) ────────────
+# ─── /addapi — single step: paste URL ─────────────────────────────────────────
+
+ADD_URL = 0   # only one ConversationHandler state needed
+
+
+def _shared_auth() -> tuple:
+    """Return (auth_token, user_id) from the first saved API, or seed fallback."""
+    try:
+        apis = load_all_apis()
+        if apis:
+            return apis[0]["auth_token"], apis[0]["user_id"]
+    except Exception:
+        pass
+    seed = BUILTIN_SITES[0]
+    return seed["auth_token"], seed["user_id"]
+
+
+def _parse_url_to_profile(raw_url: str):
+    """
+    Derive a full site profile from a bare API URL.
+
+    classx.co.in pattern:
+      https://parmaracademyapi.classx.co.in
+        → origin  = https://www.parmaracademy.in
+        → label   = Parmar Academy
+
+    teachx / akamai / anything else:
+      https://revolutioneducationapi.teachx.in
+        → origin  = https://revolutioneducationapi.teachx.in  (same)
+        → label   = Revolution Education
+
+    Returns None if URL cannot be parsed.
+    """
+    url = raw_url.strip().rstrip("/")
+    if not url.startswith("http"):
+        url = "https://" + url
+
+    parsed    = urlparse(url)
+    hostname  = parsed.hostname or ""
+    parts     = hostname.split(".")       # ['parmaracademyapi','classx','co','in']
+    if len(parts) < 2:
+        return None
+
+    subdomain = parts[0]                  # e.g. 'parmaracademyapi'
+    clean     = subdomain[:-3] if subdomain.endswith("api") else subdomain
+
+    # Human label: split camelCase / compound words and title-case
+    label = re.sub(r"([a-z])([A-Z])", r"\1 \2", clean).title()
+
+    # Key: lowercase alphanumeric slug
+    key = re.sub(r"[^a-z0-9]", "", clean.lower())[:30]
+
+    # Origin/referer
+    tld_domain = ".".join(parts[1:])
+    if "classx" in tld_domain:
+        tld_parts = parts[2:]             # skip 'classx'
+        origin    = f"https://www.{clean}.{'.'.join(tld_parts)}"
+    else:
+        origin    = url                   # teachx, akamai, etc.
+
+    auth_token, user_id = _shared_auth()
+
+    return {
+        "key":         key,
+        "label":       label,
+        "base_url":    url,
+        "origin":      origin,
+        "referer":     origin.rstrip("/") + "/",
+        "user_id":     user_id,
+        "auth_token":  auth_token,
+        "output_name": f"{key}_data.json",
+    }
+
+
+async def addapi_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "➕ Paste the ClassX / TeachX API URL:\n\n"
+        "`https://revolutioneducationapi.teachx.in`\n\n"
+        "_/cancel to abort_",
+        parse_mode="Markdown",
+    )
+    return ADD_URL
+
+
+async def addapi_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    raw     = update.message.text.strip()
+    profile = _parse_url_to_profile(raw)
+
+    if not profile:
+        await update.message.reply_text(
+            "⚠️ Couldn't parse that URL. It should look like:\n"
+            "`https://somethingapi.classx.co.in`\n"
+            "Try again or /cancel.",
+            parse_mode="Markdown",
+        )
+        return ADD_URL
+
+    # Ensure unique key
+    col          = get_apis_col()
+    original_key = profile["key"]
+    counter      = 2
+    while col.find_one({"key": profile["key"]}):
+        profile["key"] = f"{original_key}{counter}"
+        counter += 1
+
+    try:
+        upsert_api(profile)
+    except Exception as e:
+        await update.message.reply_text(f"❌ MongoDB error: {e}")
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        f"✅ *{profile['label']}* added!\n\n"
+        f"Key: `{profile['key']}`\n"
+        f"Base URL: `{profile['base_url']}`\n"
+        f"Origin: `{profile['origin']}`\n\n"
+        "Use /sites to scrape it.",
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
+
+
+# ─── /deleteapi ConversationHandler ───────────────────────────────────────────
+
+DEL_CONFIRM = 10
+
+
+async def cmd_deleteapi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        apis = load_all_apis()
+    except Exception as e:
+        await update.message.reply_text(f"❌ MongoDB error: {e}")
+        return ConversationHandler.END
+
+    if not apis:
+        await update.message.reply_text("No APIs saved yet.")
+        return ConversationHandler.END
+
+    ctx.user_data["_del_apis"] = apis
+    lines = ["🗑 *Which API do you want to delete?*\n"]
+    for i, api in enumerate(apis, 1):
+        lines.append(f"{i}. {api['label']} (`{api['key']}`)")
+    lines.append("\nReply with the number, or /cancel to abort.")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    return DEL_CONFIRM
+
+
+async def del_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    apis = ctx.user_data.get("_del_apis", [])
+    n    = parse_number(update.message.text, len(apis))
+    if n is None:
+        await update.message.reply_text(
+            f"Please send a number between 1 and {len(apis)}, or /cancel."
+        )
+        return DEL_CONFIRM
+
+    target  = apis[n - 1]
+    deleted = delete_api(target["key"])
+    if deleted:
+        await update.message.reply_text(
+            f"✅ Deleted *{target['label']}* (`{target['key']}`).",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text("⚠️ Could not delete — may already be removed.")
+    ctx.user_data.pop("_del_apis", None)
+    return ConversationHandler.END
+
+
+# ─── SCRAPER ──────────────────────────────────────────────────────────────────
 
 class ClassXScraper:
-    """
-    All extraction logic is 100% identical to the original Termux script.
-    The only addition is a `cancelled` flag for mid-run stops.
-    """
 
     def __init__(self, profile: dict):
         self.profile   = profile
         self.base_url  = profile["base_url"]
         self.cancelled = False
         self.headers   = {
-            "accept":           "*/*",
-            "accept-language":  "en-US,en;q=0.9,en-IN;q=0.8",
-            "auth-key":         "appxapi",
-            "authorization":    profile["auth_token"],
-            "client-service":   "Appx",
-            "device-type":      "website",
-            "origin":           profile["origin"],
-            "referer":          profile["referer"],
-            "source":           "website",
-            "user-agent":       (
+            "accept":          "*/*",
+            "accept-language": "en-US,en;q=0.9,en-IN;q=0.8",
+            "auth-key":        "appxapi",
+            "authorization":   profile["auth_token"],
+            "client-service":  "Appx",
+            "device-type":     "website",
+            "origin":          profile["origin"],
+            "referer":         profile["referer"],
+            "source":          "website",
+            "user-agent":      (
                 "Mozilla/5.0 (Linux; Android 15; Pixel 9) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/150.0.0.0 Mobile Safari/537.36"
             ),
-            "user-id":          profile["user_id"],
+            "user-id":         profile["user_id"],
         }
-
-    # ── Helpers (identical to original) ──────────────────────────────────────
 
     def safe_get(self, path, params=None):
         url = f"{self.base_url}{path}"
@@ -283,7 +426,7 @@ class ClassXScraper:
             return r.json()
         except requests.HTTPError as e:
             if e.response.status_code == 401:
-                raise RuntimeError("Token expired! Update auth_token via /addapi.")
+                raise RuntimeError("Token expired! Update auth_token via /deleteapi + /addapi.")
             logger.warning("HTTP %s — %s", e.response.status_code, url)
             return None
         except Exception as exc:
@@ -299,8 +442,6 @@ class ClassXScraper:
                 if k in data and isinstance(data[k], list):
                     return data[k]
         return []
-
-    # ── Series / Subjects / Tests (identical to original) ────────────────────
 
     def get_all_test_series(self) -> list:
         all_series, start = [], 0
@@ -357,8 +498,6 @@ class ClassXScraper:
             time.sleep(DELAY)
         return all_tests
 
-    # ── Question parsing (identical to original) ──────────────────────────────
-
     def parse_questions(self, raw: list) -> list:
         out = []
         for q in raw:
@@ -388,7 +527,6 @@ class ClassXScraper:
                 for k, v in raw_opts.items():
                     options.append({"id": k, "text": str(v)})
 
-            # Parmar-style: option_1 … option_10
             if not options:
                 for num in range(1, 11):
                     if q.get(f"option_{num}"):
@@ -398,7 +536,6 @@ class ClassXScraper:
                             "text_hindi": "",
                             "image":      q.get(f"option_image_{num}", ""),
                         })
-                # Legacy letter-style: option_a … option_e
                 if not options:
                     for letter in "abcde":
                         if f"option_{letter}" in q:
@@ -443,7 +580,6 @@ class ClassXScraper:
         return self.parse_questions(raw)
 
     def get_questions(self, test: dict) -> list:
-        """Identical to original — fetches EN + HI, merges bilingual data."""
         url_en = test.get("test_questions_url") or ""
         url_hi = test.get("test_questions_url_2") or ""
         if not url_en and not url_hi:
@@ -453,7 +589,7 @@ class ClassXScraper:
 
         if url_hi and url_hi != url_en:
             hi_list = self.fetch_cdn(url_hi)
-            hi = {str(q["id"]): q for q in hi_list}
+            hi      = {str(q["id"]): q for q in hi_list}
 
             if not qs and hi_list:
                 qs = hi_list
@@ -480,13 +616,10 @@ class ClassXScraper:
                             opt["image"] = ho[i].get("image", "")
         return qs
 
-    # ── Convenience: scrape a single test object ──────────────────────────────
-
     def scrape_single_test(self, test: dict) -> dict:
-        """Scrape one test and return a complete test entry dict with questions."""
         t_id   = test.get("id") or test.get("test_id") or ""
         t_name = test.get("title") or test.get("name") or f"Test #{t_id}"
-        qs = self.get_questions(test)
+        qs     = self.get_questions(test)
         return {
             "id":              t_id,
             "name":            t_name,
@@ -499,25 +632,12 @@ class ClassXScraper:
 
 
 # ─── USER SESSION STATE ───────────────────────────────────────────────────────
-# Stores per-chat state for the numbered-selection flow and addapi wizard.
-# chat_id → dict
 
-user_state: dict[int, dict] = {}
-
-# ConversationHandler states for /addapi wizard
-(
-    ADD_KEY, ADD_LABEL, ADD_BASE_URL,
-    ADD_ORIGIN, ADD_REFERER,
-    ADD_USER_ID, ADD_AUTH_TOKEN,
-) = range(7)
-
-# ConversationHandler states for /deleteapi
-DEL_CONFIRM = 10
+user_state: dict = {}
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
-def chunk_message(text: str, limit: int = 4000) -> list[str]:
-    """Split a long message into chunks ≤ limit characters."""
+def chunk_message(text: str, limit: int = 4000) -> list:
     lines   = text.split("\n")
     chunks  = []
     current = ""
@@ -532,12 +652,10 @@ def chunk_message(text: str, limit: int = 4000) -> list[str]:
 
 
 def build_numbered_list(items: list, label_fn) -> str:
-    """Return a newline-separated numbered list string."""
     return "\n".join(f"{i+1}. {label_fn(item)}" for i, item in enumerate(items))
 
 
-def parse_number(text: str, max_val: int) -> int | None:
-    """Parse a single integer 1..max_val. Returns None on invalid input."""
+def parse_number(text: str, max_val: int):
     text = text.strip()
     if re.fullmatch(r"\d+", text):
         n = int(text)
@@ -546,31 +664,17 @@ def parse_number(text: str, max_val: int) -> int | None:
     return None
 
 
-def parse_multi_selection(text: str, max_val: int) -> list[int] | None:
-    """
-    Parse a multi-quiz selection from user text.
-
-    Accepts:
-      • "all"          → [1, 2, ..., max_val]
-      • "1"            → [1]
-      • "1&3&5"        → [1, 3, 5]
-      • "1, 3, 5"      → [1, 3, 5]   (comma-separated also accepted)
-      • "1-5"          → [1, 2, 3, 4, 5]  (range)
-
-    Returns a sorted unique list of 1-based indices, or None if input is invalid.
-    """
+def parse_multi_selection(text: str, max_val: int):
     text = text.strip().lower()
 
     if text == "all":
         return list(range(1, max_val + 1))
 
-    # Normalise separators: & , space → comma
     normalised = re.sub(r"[&,\s]+", ",", text)
-    parts = [p.strip() for p in normalised.split(",") if p.strip()]
+    parts      = [p.strip() for p in normalised.split(",") if p.strip()]
 
     indices = set()
     for part in parts:
-        # Range: e.g. "2-5"
         range_match = re.fullmatch(r"(\d+)-(\d+)", part)
         if range_match:
             lo, hi = int(range_match.group(1)), int(range_match.group(2))
@@ -585,28 +689,23 @@ def parse_multi_selection(text: str, max_val: int) -> list[int] | None:
         else:
             return None
 
-    if not indices:
-        return None
-    return sorted(indices)
+    return sorted(indices) if indices else None
 
-
-# ─── SEND HELPERS ─────────────────────────────────────────────────────────────
 
 async def send_chunked(message, text: str, **kwargs):
-    """Send possibly-long text in chunks, respecting Telegram's 4096-char limit."""
     for chunk in chunk_message(text, 4000):
         await message.reply_text(chunk, **kwargs)
 
 
-# ─── COMMAND: /start ──────────────────────────────────────────────────────────
+# ─── COMMANDS ─────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *ClassX Scraper Bot v2*\n\n"
         "I scrape test series from ClassX-powered sites and send you the JSON.\n\n"
         "*Commands:*\n"
-        "• /sites — Pick a site, then a test series, then a quiz to extract\n"
-        "• /addapi — Add a new ClassX site (saved to MongoDB)\n"
+        "• /sites — Pick a site, series and quiz to extract\n"
+        "• /addapi — Add a new site by pasting its API URL\n"
         "• /listapis — View all saved sites\n"
         "• /deleteapi — Remove a saved site\n"
         "• /cancel — Cancel any active operation\n"
@@ -615,34 +714,27 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ─── COMMAND: /help ───────────────────────────────────────────────────────────
-
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 *ClassX Scraper Bot — Help*\n\n"
-        "*Scraping flow (no buttons, all text-based):*\n"
-        "1️⃣ /sites → I show a numbered list of sites.\n"
-        "   Reply with the number of the site you want.\n"
-        "2️⃣ I fetch that site's test series and show them numbered.\n"
-        "   Reply with the number of the series you want.\n"
-        "3️⃣ I show all quizzes inside that series, numbered.\n"
-        "   Reply with your selection:\n"
-        "   • Single quiz → `3`\n"
+        "*Scraping flow:*\n"
+        "1️⃣ /sites → numbered list of sites → reply with number\n"
+        "2️⃣ Numbered list of test series → reply with number\n"
+        "3️⃣ Numbered list of quizzes → reply with selection:\n"
+        "   • Single → `3`\n"
         "   • Multiple → `1&3&5`\n"
         "   • Range → `2-6`\n"
         "   • All → `all`\n"
-        "4️⃣ Each selected quiz is scraped and sent as a separate JSON file. ✅\n\n"
-        "*Managing sites (MongoDB):*\n"
-        "• /addapi — Walk through adding a new ClassX site step-by-step.\n"
+        "4️⃣ Each quiz sent as a separate JSON file ✅\n\n"
+        "*Managing sites:*\n"
+        "• /addapi — Paste one URL, done.\n"
         "• /listapis — See all saved sites.\n"
-        "• /deleteapi — Delete a site by picking its number.\n\n"
-        "• /cancel — Cancel any in-progress wizard or selection.\n\n"
-        "⚠️ If a token expires, delete the site via /deleteapi and re-add it with /addapi.",
+        "• /deleteapi — Delete a site by number.\n"
+        "• /cancel — Cancel any wizard.\n\n"
+        "⚠️ If a token expires, delete the site and re-add it.",
         parse_mode="Markdown",
     )
 
-
-# ─── COMMAND: /listapis ───────────────────────────────────────────────────────
 
 async def cmd_listapis(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
@@ -666,188 +758,8 @@ async def cmd_listapis(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await send_chunked(update.message, "\n".join(lines), parse_mode="Markdown")
 
 
-# ─── COMMAND: /deleteapi  (simple ConversationHandler) ────────────────────────
-
-async def cmd_deleteapi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        apis = load_all_apis()
-    except Exception as e:
-        await update.message.reply_text(f"❌ MongoDB error: {e}")
-        return ConversationHandler.END
-
-    if not apis:
-        await update.message.reply_text("No APIs saved yet.")
-        return ConversationHandler.END
-
-    ctx.user_data["_del_apis"] = apis
-    lines = ["🗑 *Which API do you want to delete?*\n"]
-    for i, api in enumerate(apis, 1):
-        lines.append(f"{i}. {api['label']} (`{api['key']}`)")
-    lines.append("\nReply with the number, or /cancel to abort.")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-    return DEL_CONFIRM
-
-
-async def del_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    apis = ctx.user_data.get("_del_apis", [])
-    n = parse_number(update.message.text, len(apis))
-    if n is None:
-        await update.message.reply_text(
-            f"Please send a number between 1 and {len(apis)}, or /cancel."
-        )
-        return DEL_CONFIRM
-
-    target = apis[n - 1]
-    deleted = delete_api(target["key"])
-    if deleted:
-        await update.message.reply_text(
-            f"✅ Deleted *{target['label']}* (`{target['key']}`).",
-            parse_mode="Markdown",
-        )
-    else:
-        await update.message.reply_text("⚠️ Could not delete — it may have already been removed.")
-    ctx.user_data.pop("_del_apis", None)
-    return ConversationHandler.END
-
-
-# ─── /addapi  ConversationHandler ─────────────────────────────────────────────
-
-async def addapi_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["_new_api"] = {}
-    await update.message.reply_text(
-        "➕ *Add a new ClassX API — Step 1/7*\n\n"
-        "Send a short *unique key* for this site (e.g. `parmar`, `mysite`).\n"
-        "Lowercase letters and underscores only. /cancel to abort.",
-        parse_mode="Markdown",
-    )
-    return ADD_KEY
-
-
-async def addapi_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    key = update.message.text.strip().lower()
-    if not re.fullmatch(r"[a-z0-9_]+", key):
-        await update.message.reply_text("Invalid key. Use only lowercase letters, digits, underscores.")
-        return ADD_KEY
-    # Check duplicate
-    existing = get_api_by_key(key)
-    if existing:
-        await update.message.reply_text(
-            f"⚠️ Key `{key}` already exists ({existing['label']}). Choose a different key.",
-            parse_mode="Markdown",
-        )
-        return ADD_KEY
-    ctx.user_data["_new_api"]["key"] = key
-    await update.message.reply_text(
-        "✅ Key set.\n\n*Step 2/7* — Send the *display label* (e.g. `Parmar Academy`):",
-        parse_mode="Markdown",
-    )
-    return ADD_LABEL
-
-
-async def addapi_label(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["_new_api"]["label"] = update.message.text.strip()
-    await update.message.reply_text(
-        "✅ Label set.\n\n*Step 3/7* — Send the *base API URL*.\n"
-        "Example: `https://parmaracademyapi.classx.co.in`",
-        parse_mode="Markdown",
-    )
-    return ADD_BASE_URL
-
-
-async def addapi_base_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip().rstrip("/")
-    ctx.user_data["_new_api"]["base_url"] = url
-    await update.message.reply_text(
-        "✅ Base URL set.\n\n*Step 4/7* — Send the *origin URL*.\n"
-        "Example: `https://www.parmaracademy.in`",
-        parse_mode="Markdown",
-    )
-    return ADD_ORIGIN
-
-
-async def addapi_origin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["_new_api"]["origin"] = update.message.text.strip().rstrip("/")
-    await update.message.reply_text(
-        "✅ Origin set.\n\n*Step 5/7* — Send the *referer URL*.\n"
-        "Usually the origin with a trailing slash. Example: `https://www.parmaracademy.in/`",
-        parse_mode="Markdown",
-    )
-    return ADD_REFERER
-
-
-async def addapi_referer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ref = update.message.text.strip()
-    if not ref.endswith("/"):
-        ref += "/"
-    ctx.user_data["_new_api"]["referer"] = ref
-    await update.message.reply_text(
-        "✅ Referer set.\n\n*Step 6/7* — Send your *ClassX User ID*.\n"
-        "Example: `391142`",
-        parse_mode="Markdown",
-    )
-    return ADD_USER_ID
-
-
-async def addapi_user_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.message.text.strip()
-    ctx.user_data["_new_api"]["user_id"] = uid
-    await update.message.reply_text(
-        "✅ User ID set.\n\n*Step 7/7* — Send your *ClassX Auth Token* (the JWT string).\n"
-        "This is the long `eyJ...` string from your browser/app.",
-        parse_mode="Markdown",
-    )
-    return ADD_AUTH_TOKEN
-
-
-async def addapi_auth_token(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    token = update.message.text.strip()
-    new_api = ctx.user_data["_new_api"]
-    new_api["auth_token"]  = token
-    key = new_api["key"]
-    new_api["output_name"] = f"{key}_data.json"
-
-    try:
-        upsert_api(new_api)
-    except Exception as e:
-        await update.message.reply_text(f"❌ MongoDB save error: {e}")
-        return ConversationHandler.END
-
-    await update.message.reply_text(
-        f"✅ *{new_api['label']}* saved to MongoDB!\n\n"
-        f"Key: `{key}`\n"
-        f"Use /sites to start scraping it.",
-        parse_mode="Markdown",
-    )
-    ctx.user_data.pop("_new_api", None)
-    return ConversationHandler.END
-
-
-async def conv_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data.pop("_new_api", None)
-    ctx.user_data.pop("_del_apis", None)
-    # Also clear selection state
-    user_state.pop(update.effective_chat.id, None)
-
-    cmd = update.message.text.strip().lstrip("/").split()[0].lower() if update.message.text else ""
-
-    # If the user sent /sites while inside a wizard, silently exit the wizard
-    # and immediately run the /sites flow instead of showing "Cancelled."
-    if cmd == "sites":
-        return await cmd_sites.__wrapped__(update, ctx) if hasattr(cmd_sites, "__wrapped__") else await cmd_sites(update, ctx)
-    if cmd == "deleteapi":
-        return await cmd_deleteapi.__wrapped__(update, ctx) if hasattr(cmd_deleteapi, "__wrapped__") else await cmd_deleteapi(update, ctx)
-    if cmd == "addapi":
-        return await addapi_start.__wrapped__(update, ctx) if hasattr(addapi_start, "__wrapped__") else await addapi_start(update, ctx)
-
-    await update.message.reply_text("❌ Cancelled.")
-    return ConversationHandler.END
-
-
-# ─── COMMAND: /sites → numbered selection flow ────────────────────────────────
-
 async def cmd_sites(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    # Clear any previous selection state and wizard data for this user
     user_state.pop(chat_id, None)
     ctx.user_data.pop("_new_api", None)
     ctx.user_data.pop("_del_apis", None)
@@ -875,27 +787,41 @@ async def cmd_sites(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ─── TEXT HANDLER — drives the numbered-selection flow ────────────────────────
+async def conv_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.pop("_new_api", None)
+    ctx.user_data.pop("_del_apis", None)
+    user_state.pop(update.effective_chat.id, None)
+
+    cmd = ""
+    if update.message and update.message.text:
+        cmd = update.message.text.strip().lstrip("/").split()[0].lower()
+
+    if cmd == "sites":
+        return await cmd_sites(update, ctx)
+    if cmd == "deleteapi":
+        return await cmd_deleteapi(update, ctx)
+    if cmd == "addapi":
+        return await addapi_start(update, ctx)
+
+    await update.message.reply_text("❌ Cancelled.")
+    return ConversationHandler.END
+
+
+# ─── TEXT HANDLER — numbered selection flow ───────────────────────────────────
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    Handles plain text messages that drive the numbered selection flow:
-      site_select → series_select → quiz_select → (scrape)
-    """
     chat_id = update.effective_chat.id
     state   = user_state.get(chat_id)
-
     if not state:
-        # No active flow — ignore (don't confuse with addapi wizard)
         return
 
     step = state.get("step")
     text = update.message.text.strip()
 
-    # ── STEP 1: User selects a site ──────────────────────────────────────────
+    # ── Step 1: select site ───────────────────────────────────────────────────
     if step == "site_select":
         apis = state["apis"]
-        n = parse_number(text, len(apis))
+        n    = parse_number(text, len(apis))
         if n is None:
             await update.message.reply_text(
                 f"Please reply with a number between 1 and {len(apis)}."
@@ -906,18 +832,16 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         state["profile"] = profile
 
         await update.message.reply_text(
-            f"⏳ Fetching test series from *{profile['label']}*…\nThis may take a moment.",
+            f"⏳ Fetching test series from *{profile['label']}*…",
             parse_mode="Markdown",
         )
 
-        loop = asyncio.get_event_loop()
+        loop    = asyncio.get_event_loop()
         scraper = ClassXScraper(profile)
         state["scraper"] = scraper
 
         try:
-            series_list = await loop.run_in_executor(
-                None, scraper.get_all_test_series
-            )
+            series_list = await loop.run_in_executor(None, scraper.get_all_test_series)
         except RuntimeError as e:
             user_state.pop(chat_id, None)
             await update.message.reply_text(f"❌ {e}")
@@ -945,11 +869,11 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
 
-    # ── STEP 2: User selects a test series ───────────────────────────────────
+    # ── Step 2: select test series ────────────────────────────────────────────
     elif step == "series_select":
         series_list = state["series_list"]
         profile     = state["profile"]
-        n = parse_number(text, len(series_list))
+        n           = parse_number(text, len(series_list))
         if n is None:
             await update.message.reply_text(
                 f"Please reply with a number between 1 and {len(series_list)}."
@@ -967,9 +891,8 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
         loop    = asyncio.get_event_loop()
-        scraper: ClassXScraper = state["scraper"]
+        scraper = state["scraper"]
 
-        # Gather subjects, then tests under each subject
         subjects = await loop.run_in_executor(None, scraper.get_subjects, s_id)
         if not subjects:
             subjects = [{"subjectid": 0, "subject_name": "All Tests"}]
@@ -981,7 +904,6 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             tests = await loop.run_in_executor(
                 None, scraper.get_tests, s_id, subj_id
             )
-            # Tag each test with its subject name for display
             subj_name = (subj.get("subject_name") or subj.get("name")
                          or subj.get("title") or "")
             for t in tests:
@@ -990,8 +912,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if not all_tests:
             await update.message.reply_text(
-                f"⚠️ No quizzes found inside *{s_name}*.\n"
-                "Try a different series.",
+                f"⚠️ No quizzes found inside *{s_name}*. Try a different series.",
                 parse_mode="Markdown",
             )
             state["step"] = "series_select"
@@ -1001,10 +922,10 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         state["step"]      = "quiz_select"
 
         def test_label(t):
-            name = t.get("title") or t.get("name") or f"ID:{t.get('id','')}"
-            subj = t.get("_subject_name", "")
-            marks = t.get("marks", "")
-            mins  = t.get("time", "")
+            name   = t.get("title") or t.get("name") or f"ID:{t.get('id','')}"
+            subj   = t.get("_subject_name", "")
+            marks  = t.get("marks", "")
+            mins   = t.get("time", "")
             extras = []
             if subj:  extras.append(subj)
             if marks: extras.append(f"{marks} marks")
@@ -1020,21 +941,20 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Reply with your selection:\n"
             f"• Single quiz → `3`\n"
-            f"• Multiple quizzes → `1&3&5`\n"
-            f"• A range → `2-6`\n"
+            f"• Multiple → `1&3&5`\n"
+            f"• Range → `2-6`\n"
             f"• Everything → `all`",
             parse_mode="Markdown",
         )
 
-    # ── STEP 3: User selects quiz(zes) → scrape them ─────────────────────────
+    # ── Step 3: select quiz(zes) and scrape ───────────────────────────────────
     elif step == "quiz_select":
         all_tests = state["all_tests"]
         profile   = state["profile"]
         series    = state["series"]
-        scraper: ClassXScraper = state["scraper"]
-        s_name = series.get("title") or series.get("name") or ""
+        scraper   = state["scraper"]
+        s_name    = series.get("title") or series.get("name") or ""
 
-        # Parse multi-selection: "all", "1", "1&3&5", "2-6", etc.
         indices = parse_multi_selection(text, len(all_tests))
         if indices is None:
             await update.message.reply_text(
@@ -1050,24 +970,21 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         selected_tests = [all_tests[i - 1] for i in indices]
         total_selected = len(selected_tests)
-
-        # Clear state — scraping begins now
         user_state.pop(chat_id, None)
 
         await update.message.reply_text(
             f"⏳ Starting extraction of *{total_selected}* quiz(zes)…\n"
-            f"Each quiz will be sent as a separate JSON file.",
+            "Each quiz will be sent as a separate JSON file.",
             parse_mode="Markdown",
         )
 
-        loop = asyncio.get_event_loop()
+        loop          = asyncio.get_event_loop()
         success_count = 0
         fail_count    = 0
 
         for idx, (orig_num, test) in enumerate(zip(indices, selected_tests), 1):
             t_name = test.get("title") or test.get("name") or f"ID:{test.get('id','')}"
 
-            # Progress ping every quiz
             progress_msg = await ctx.bot.send_message(
                 chat_id,
                 f"⏳ [{idx}/{total_selected}] Scraping *{t_name}*…",
@@ -1088,20 +1005,18 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 fail_count += 1
                 continue
 
-            total_q = t_entry["total_questions"]
-            output  = {
+            total_q   = t_entry["total_questions"]
+            output    = {
                 "site":       profile["label"],
                 "fetched_at": datetime.now().isoformat(),
                 "series":     s_name,
                 "test":       t_entry,
             }
-
             json_bytes = json.dumps(output, indent=2, ensure_ascii=False).encode("utf-8")
             size_kb    = len(json_bytes) / 1024
             safe_name  = re.sub(r"[^\w\- ]", "_", t_name)[:60]
             filename   = f"{safe_name}.json"
 
-            # Update progress message to show done
             await ctx.bot.edit_message_text(
                 f"✅ [{idx}/{total_selected}] *{t_name}*\n"
                 f"❓ {total_q} questions  •  📦 {size_kb:.1f} KB",
@@ -1113,21 +1028,19 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if len(json_bytes) > 50 * 1024 * 1024:
                 await ctx.bot.send_message(
                     chat_id,
-                    f"⚠️ *{t_name}* is over Telegram's 50 MB limit and was skipped.",
+                    f"⚠️ *{t_name}* exceeds Telegram's 50 MB limit — skipped.",
                     parse_mode="Markdown",
                 )
                 fail_count += 1
             else:
-                file_obj = BytesIO(json_bytes)
                 await ctx.bot.send_document(
                     chat_id=chat_id,
-                    document=file_obj,
+                    document=BytesIO(json_bytes),
                     filename=filename,
                     caption=f"📄 {t_name}\n❓ {total_q} questions",
                 )
                 success_count += 1
 
-        # Final summary
         summary = (
             f"🎉 *All done!*\n"
             f"✅ Sent: {success_count}/{total_selected}\n"
@@ -1135,53 +1048,34 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if fail_count:
             summary += f"❌ Failed: {fail_count}/{total_selected}\n"
         summary += "\nUse /sites to scrape more."
-
         await ctx.bot.send_message(chat_id, summary, parse_mode="Markdown")
 
 
-# ─── SELF-PING / WEB SERVER ───────────────────────────────────────────────────
+# ─── HEALTH SERVER + SELF-PING ────────────────────────────────────────────────
 
 async def health_handler(request: web.Request) -> web.Response:
-    """
-    Simple HTTP endpoint.
-    Render uses /health to mark the service as Live.
-    The self-ping loop hits / every 4 min to prevent free-plan spin-down.
-    """
     return web.Response(text="OK ✅", status=200)
 
 
 async def start_web_server():
-    """Start the aiohttp health-check server on PORT."""
     web_app = web.Application()
     web_app.router.add_get("/",       health_handler)
     web_app.router.add_get("/health", health_handler)
-
     runner = web.AppRunner(web_app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
     logger.info("Health server listening on port %d", PORT)
 
 
 async def self_ping_loop():
-    """
-    Pings the bot's own public URL every PING_INTERVAL seconds so Render's
-    free plan never spins the container down after 15 min of inactivity.
-
-    Falls back to localhost if RENDER_EXTERNAL_URL is not set (local dev).
-    """
-    await asyncio.sleep(20)  # give the server a moment to start
-
-    target = (RENDER_URL.rstrip("/") if RENDER_URL else f"http://localhost:{PORT}")
-    logger.info("Self-ping loop started → %s  (every %ds)", target, PING_INTERVAL)
-
+    await asyncio.sleep(20)
+    target = RENDER_URL.rstrip("/") if RENDER_URL else f"http://localhost:{PORT}"
+    logger.info("Self-ping → %s every %ds", target, PING_INTERVAL)
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                async with session.get(
-                    target, timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp:
-                    logger.debug("Self-ping %s → %s", target, resp.status)
+                async with session.get(target, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    logger.debug("Self-ping %s → %s", target, r.status)
             except Exception as e:
                 logger.warning("Self-ping failed: %s", e)
             await asyncio.sleep(PING_INTERVAL)
@@ -1195,35 +1089,26 @@ async def main():
         print("  export BOT_TOKEN='123456:ABC-...'")
         return
 
-    # Verify MongoDB on startup
     try:
         get_apis_col()
         logger.info("MongoDB connected ✅")
     except Exception as e:
         logger.error("MongoDB connection failed: %s", e)
         print(f"ERROR: Cannot connect to MongoDB — {e}")
-        print(f"  Make sure MongoDB is running at: {MONGO_URI}")
         return
 
-    # ── Build PTB app ─────────────────────────────────────────────────────────
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # /addapi wizard
+    # /addapi — single-step wizard
     add_conv = ConversationHandler(
         entry_points=[CommandHandler("addapi", addapi_start)],
         states={
-            ADD_KEY:        [MessageHandler(filters.TEXT & ~filters.COMMAND, addapi_key)],
-            ADD_LABEL:      [MessageHandler(filters.TEXT & ~filters.COMMAND, addapi_label)],
-            ADD_BASE_URL:   [MessageHandler(filters.TEXT & ~filters.COMMAND, addapi_base_url)],
-            ADD_ORIGIN:     [MessageHandler(filters.TEXT & ~filters.COMMAND, addapi_origin)],
-            ADD_REFERER:    [MessageHandler(filters.TEXT & ~filters.COMMAND, addapi_referer)],
-            ADD_USER_ID:    [MessageHandler(filters.TEXT & ~filters.COMMAND, addapi_user_id)],
-            ADD_AUTH_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, addapi_auth_token)],
+            ADD_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, addapi_url)],
         },
         fallbacks=[
             CommandHandler("cancel",    conv_cancel),
-            CommandHandler("sites",     conv_cancel),   # /sites exits the wizard
-            CommandHandler("deleteapi", conv_cancel),   # /deleteapi exits the wizard
+            CommandHandler("sites",     conv_cancel),
+            CommandHandler("deleteapi", conv_cancel),
         ],
     )
 
@@ -1235,25 +1120,22 @@ async def main():
         },
         fallbacks=[
             CommandHandler("cancel",  conv_cancel),
-            CommandHandler("sites",   conv_cancel),   # /sites exits the wizard
-            CommandHandler("addapi",  conv_cancel),   # /addapi exits the wizard
+            CommandHandler("sites",   conv_cancel),
+            CommandHandler("addapi",  conv_cancel),
         ],
     )
 
-    app.add_handler(CommandHandler("start",     cmd_start))
-    app.add_handler(CommandHandler("help",      cmd_help))
-    app.add_handler(CommandHandler("listapis",  cmd_listapis))
-    app.add_handler(CommandHandler("sites",     cmd_sites))
-    app.add_handler(CommandHandler("cancel",    conv_cancel))
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("help",     cmd_help))
+    app.add_handler(CommandHandler("listapis", cmd_listapis))
+    app.add_handler(CommandHandler("sites",    cmd_sites))
+    app.add_handler(CommandHandler("cancel",   conv_cancel))
     app.add_handler(add_conv)
     app.add_handler(del_conv)
-
-    # Plain text drives the numbered selection flow
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # ── Start everything together ──────────────────────────────────────────────
-    await start_web_server()                      # aiohttp health server
-    asyncio.create_task(self_ping_loop())         # self-ping to prevent spin-down
+    await start_web_server()
+    asyncio.create_task(self_ping_loop())
 
     await app.initialize()
     await app.start()
@@ -1261,7 +1143,6 @@ async def main():
 
     logger.info("✅ ClassX Telegram Bot v2 running.")
 
-    # Block forever (until Ctrl+C / SIGTERM)
     try:
         await asyncio.Event().wait()
     finally:
