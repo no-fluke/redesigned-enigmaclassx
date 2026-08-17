@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: classx-scraper-bot
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+
+    # Render pings this to confirm the service is alive
+    healthCheckPath: /health
+
+    envVars:
+      # ── Required — set these in the Render dashboard ────────────────────────
+      - key: BOT_TOKEN
+        sync: false          # paste your token from @BotFather
+
+      - key: MONGO_URI
+        sync: false          # e.g. mongodb+srv://user:pass@cluster.mongodb.net/
+
+      # ── Optional — safe defaults ─────────────────────────────────────────────
+      - key: PORT
+        value: "8080"
+
+      # Render injects this automatically — the self-ping loop uses it to know
+      # the service's own public URL so it can ping itself.
+      - key: RENDER_EXTERNAL_URL
+        fromService:
+          name: classx-scraper-bot
+          type: web
+          property: host

@@ -1,0 +1,4 @@
+python-telegram-bot>=20.0
+pymongo>=4.6
+requests>=2.31
+aiohttp>=3.9
