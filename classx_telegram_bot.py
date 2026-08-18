@@ -24,6 +24,7 @@ NEW in v2:
               → bot fetches quizzes for that series ID → same quiz selection flow
                   "3" / "1&3&5" / "2-6" / "all"
               → bot scrapes and sends JSON files
+              (now shows the REAL series name, not just "Manual Series #ID")
 
   • /search command  — probe a range of series IDs and show which ones exist.
       /search → numbered list of sites → reply with number
@@ -477,6 +478,38 @@ class ClassXScraper:
             time.sleep(DELAY)
         return all_series
 
+    def get_series_name_by_id(self, series_id: str) -> str:
+        """
+        Search the series list for a matching ID and return the real series name.
+        Paginates through the full list until found or exhausted.
+        Falls back to 'Series #<id>' if not found or on any error.
+        """
+        start = 0
+        while not self.cancelled:
+            data = self.safe_get(
+                "/get/test_series",
+                params={"start": start, "search": "",
+                        "client_api_url": "", "exam_id": ""},
+            )
+            if data is None:
+                break
+            items = self.extract_list(data)
+            if not items:
+                break
+            for item in items:
+                item_id = str(item.get("id") or item.get("series_id") or "")
+                if item_id == series_id:
+                    name = (
+                        item.get("title")
+                        or item.get("name")
+                        or item.get("test_series_name")
+                        or ""
+                    )
+                    return name if name else f"Series #{series_id}"
+            start += len(items)
+            time.sleep(DELAY)
+        return f"Series #{series_id}"
+
     def get_subjects(self, series_id) -> list:
         data = self.safe_get(
             "/get/testseries_subjects",
@@ -877,7 +910,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "1️⃣ /manual → numbered list of sites → reply with number\n"
         "2️⃣ Bot asks for a test series ID → type any numeric ID\n"
         "   (You can enter multiple IDs separated by spaces to batch-fetch)\n"
-        "3️⃣ Same quiz selection flow as above\n\n"
+        "3️⃣ Bot resolves the real series name from the API ✅\n"
+        "4️⃣ Same quiz selection flow as above\n\n"
         "*Search / discover mode (/search):*\n"
         "1️⃣ /search → pick a site\n"
         "2️⃣ Enter an ID range → `100-150`  (max 200 IDs)\n"
@@ -1142,7 +1176,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
 
-    # Manual step 2: receive series ID(s) and fetch quizzes
+    # Manual step 2: receive series ID(s), resolve real names, fetch quizzes
     elif step == "manual_series_id":
         await _handle_manual_series_id(update, ctx, chat_id, state, text)
 
@@ -1245,9 +1279,12 @@ async def _handle_series_select(update, ctx, chat_id, state, text):
 async def _handle_manual_series_id(update, ctx, chat_id, state, text):
     """
     Receive one or more space-separated series IDs from the user,
-    fetch quizzes from all of them, and present a combined numbered list.
+    fetch quizzes from all of them, resolve the REAL series name for each ID
+    from the API (instead of using a generic 'Manual Series #ID' label),
+    and present a combined numbered quiz list.
     """
     raw_ids = text.split()
+
     # Validate: all tokens must be numeric
     if not raw_ids or not all(re.fullmatch(r"\d+", sid) for sid in raw_ids):
         await update.message.reply_text(
@@ -1263,7 +1300,7 @@ async def _handle_manual_series_id(update, ctx, chat_id, state, text):
     loop    = asyncio.get_event_loop()
 
     # Deduplicate while preserving order
-    seen    = set()
+    seen = set()
     series_ids = []
     for sid in raw_ids:
         if sid not in seen:
@@ -1276,9 +1313,11 @@ async def _handle_manual_series_id(update, ctx, chat_id, state, text):
         parse_mode="Markdown",
     )
 
-    all_tests  = []
-    found_ids  = []
-    missed_ids = []
+    all_tests    = []
+    found_ids    = []
+    missed_ids   = []
+    # Map series_id → resolved real name
+    series_names: dict = {}
 
     for sid in series_ids:
         # Fetch subjects for this series ID
@@ -1297,12 +1336,32 @@ async def _handle_manual_series_id(update, ctx, chat_id, state, text):
                          or subj.get("title") or "")
             for t in tests:
                 t["_subject_name"] = subj_name
-                t["_series_id"]    = sid   # tag so we know which series it came from
+                t["_series_id"]    = sid
             series_tests.extend(tests)
 
         if series_tests:
             all_tests.extend(series_tests)
             found_ids.append(sid)
+
+            # ── Resolve the real series name ──────────────────────────────────
+            # Priority 1: read from the first test's own metadata fields
+            #   (some ClassX APIs embed the series name inside each test object)
+            first_test = series_tests[0]
+            real_name  = (
+                first_test.get("test_series_name")
+                or first_test.get("series_name")
+                or first_test.get("series_title")
+                or first_test.get("testseries_name")
+                or ""
+            )
+
+            # Priority 2: search the full series list via the API
+            if not real_name:
+                real_name = await loop.run_in_executor(
+                    None, scraper.get_series_name_by_id, sid
+                )
+
+            series_names[sid] = real_name or f"Series #{sid}"
         else:
             missed_ids.append(sid)
 
@@ -1315,20 +1374,34 @@ async def _handle_manual_series_id(update, ctx, chat_id, state, text):
         # Stay in the same step so the user can retry
         return
 
-    # Build a human-readable series name for the output JSON
+    # Build a human-readable combined series name for the output JSON
     if len(found_ids) == 1:
-        series_name = f"Manual Series #{found_ids[0]}"
+        series_name = series_names[found_ids[0]]
     else:
-        series_name = "Manual Series #" + "+".join(found_ids)
+        # Multiple IDs: join individual names
+        parts = [series_names.get(sid, f"Series #{sid}") for sid in found_ids]
+        series_name = " + ".join(parts)
 
-    state["all_tests"]   = all_tests
-    state["series_name"] = series_name
-    state["step"]        = "manual_quiz_select"
+    state["all_tests"]    = all_tests
+    state["series_name"]  = series_name
+    state["series_names"] = series_names  # keep per-ID names for per-test JSON
+    state["step"]         = "manual_quiz_select"
 
     # Warn about any IDs that returned nothing
     if missed_ids:
         await update.message.reply_text(
             f"⚠️ No quizzes found for series ID(s): {', '.join(missed_ids)} — skipped.",
+        )
+
+    # Show which real names were resolved
+    if len(found_ids) > 1:
+        name_lines = "\n".join(
+            f"• ID `{sid}` → *{series_names.get(sid, sid)}*"
+            for sid in found_ids
+        )
+        await update.message.reply_text(
+            f"✅ Resolved series names:\n{name_lines}",
+            parse_mode="Markdown",
         )
 
     await _send_quiz_list(update.message, all_tests, series_name)
