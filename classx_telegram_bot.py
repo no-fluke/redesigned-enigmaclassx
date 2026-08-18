@@ -786,21 +786,49 @@ async def send_chunked(message, text: str, **kwargs):
 
 # ─── SHARED QUIZ SCRAPE LOGIC (used by both /sites and /manual) ───────────────
 
+def _build_progress_bar(done: int, total: int, width: int = 20) -> str:
+    """Return a text progress bar like ▓▓▓▓▓░░░░░ 5/10."""
+    filled = round(width * done / total) if total else 0
+    bar    = "▓" * filled + "░" * (width - filled)
+    pct    = int(100 * done / total) if total else 0
+    return f"[{bar}] {done}/{total} ({pct}%)"
+
+
 async def run_quiz_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                           chat_id: int, all_tests: list, profile: dict,
                           series_name: str, scraper: ClassXScraper,
                           indices: list):
     """
-    Given a resolved list of 1-based indices into all_tests, scrape each quiz
-    and send it as a JSON file. Shared between the /sites and /manual flows.
+    Scrape each selected quiz and send it as a JSON file.
+    A single progress message is edited in-place — no per-quiz spam.
     """
     selected_tests = [all_tests[i - 1] for i in indices]
     total_selected = len(selected_tests)
 
-    await ctx.bot.send_message(
+    def _status_text(done: int, current_name: str,
+                     success: int, fail: int, done_flag: bool = False) -> str:
+        bar    = _build_progress_bar(done, total_selected)
+        header = "🎉 *Done!*" if done_flag else "⏳ *Scraping…*"
+        lines  = [
+            header,
+            f"`{bar}`",
+            "",
+            f"📚 *Series:* {series_name}",
+        ]
+        if not done_flag:
+            lines.append(f"🔄 *Now:* {current_name}")
+        if success:
+            lines.append(f"✅ Sent: {success}")
+        if fail:
+            lines.append(f"❌ Failed: {fail}")
+        if done_flag:
+            lines.append("\nUse /sites or /manual to scrape more.")
+        return "\n".join(lines)
+
+    # Send the initial progress message
+    progress_msg = await ctx.bot.send_message(
         chat_id,
-        f"⏳ Starting extraction of *{total_selected}* quiz(zes)…\n"
-        "Each quiz will be sent as a separate JSON file.",
+        _status_text(0, selected_tests[0].get("title") or "—", 0, 0),
         parse_mode="Markdown",
     )
 
@@ -811,70 +839,59 @@ async def run_quiz_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     for idx, (orig_num, test) in enumerate(zip(indices, selected_tests), 1):
         t_name = test.get("title") or test.get("name") or f"ID:{test.get('id','')}"
 
-        progress_msg = await ctx.bot.send_message(
-            chat_id,
-            f"⏳ [{idx}/{total_selected}] Scraping *{t_name}*…",
-            parse_mode="Markdown",
-        )
+        # Update bar to show current quiz
+        try:
+            await ctx.bot.edit_message_text(
+                _status_text(idx - 1, t_name, success_count, fail_count),
+                chat_id=chat_id,
+                message_id=progress_msg.message_id,
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
 
         try:
             t_entry = await loop.run_in_executor(
                 None, scraper.scrape_single_test, test
             )
         except Exception as e:
-            await ctx.bot.edit_message_text(
-                f"❌ [{idx}/{total_selected}] Failed — *{t_name}*\n`{e}`",
-                chat_id=chat_id,
-                message_id=progress_msg.message_id,
-                parse_mode="Markdown",
-            )
+            logger.warning("Scrape failed for %s: %s", t_name, e)
             fail_count += 1
             continue
 
-        total_q   = t_entry["total_questions"]
-        output    = {
+        total_q    = t_entry["total_questions"]
+        output     = {
             "site":       profile["label"],
             "fetched_at": datetime.now().isoformat(),
             "series":     series_name,
             "test":       t_entry,
         }
         json_bytes = json.dumps(output, indent=2, ensure_ascii=False).encode("utf-8")
-        size_kb    = len(json_bytes) / 1024
         safe_name  = re.sub(r"[^\w\- ]", "_", t_name)[:60]
         filename   = f"{safe_name}.json"
 
-        await ctx.bot.edit_message_text(
-            f"✅ [{idx}/{total_selected}] *{t_name}*\n"
-            f"❓ {total_q} questions  •  📦 {size_kb:.1f} KB",
-            chat_id=chat_id,
-            message_id=progress_msg.message_id,
-            parse_mode="Markdown",
-        )
-
         if len(json_bytes) > 50 * 1024 * 1024:
-            await ctx.bot.send_message(
-                chat_id,
-                f"⚠️ *{t_name}* exceeds Telegram's 50 MB limit — skipped.",
-                parse_mode="Markdown",
-            )
+            logger.warning("%s exceeds 50 MB — skipped.", t_name)
             fail_count += 1
         else:
             await ctx.bot.send_document(
                 chat_id=chat_id,
                 document=BytesIO(json_bytes),
                 filename=filename,
-                caption=f"📄 {t_name}\n❓ {total_q} questions",
+                caption=f"📄 {t_name}  •  ❓ {total_q} questions",
             )
             success_count += 1
 
-    summary = (
-        f"🎉 *All done!*\n"
-        f"✅ Sent: {success_count}/{total_selected}\n"
-    )
-    if fail_count:
-        summary += f"❌ Failed: {fail_count}/{total_selected}\n"
-    summary += "\nUse /sites or /manual to scrape more."
-    await ctx.bot.send_message(chat_id, summary, parse_mode="Markdown")
+    # Final update — show completed bar
+    try:
+        await ctx.bot.edit_message_text(
+            _status_text(total_selected, "", success_count, fail_count, done_flag=True),
+            chat_id=chat_id,
+            message_id=progress_msg.message_id,
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
 
 
 # ─── COMMANDS ─────────────────────────────────────────────────────────────────
