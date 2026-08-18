@@ -18,6 +18,13 @@ NEW in v2:
                   "all"     → every quiz in the series
               → bot scrapes each selected quiz and sends a separate JSON file per quiz
 
+  • /manual command  — skip the series list; enter a test series ID directly.
+      /manual → numbered list of sites → reply with number
+              → bot asks for test series ID → user types the ID
+              → bot fetches quizzes for that series ID → same quiz selection flow
+                  "3" / "1&3&5" / "2-6" / "all"
+              → bot scrapes and sends JSON files
+
 INSTALL:
   pip install python-telegram-bot pymongo requests aiohttp
 
@@ -35,6 +42,7 @@ COMMANDS:
   /start        — Welcome
   /help         — Full help text
   /sites        — Pick a site (numbered list)
+  /manual       — Enter a test series ID manually (skip series list)
   /addapi       — Paste a ClassX API URL to add it (1 step)
   /listapis     — Show all saved APIs
   /deleteapi    — Delete an API by number
@@ -697,6 +705,99 @@ async def send_chunked(message, text: str, **kwargs):
         await message.reply_text(chunk, **kwargs)
 
 
+# ─── SHARED QUIZ SCRAPE LOGIC (used by both /sites and /manual) ───────────────
+
+async def run_quiz_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                          chat_id: int, all_tests: list, profile: dict,
+                          series_name: str, scraper: ClassXScraper,
+                          indices: list):
+    """
+    Given a resolved list of 1-based indices into all_tests, scrape each quiz
+    and send it as a JSON file. Shared between the /sites and /manual flows.
+    """
+    selected_tests = [all_tests[i - 1] for i in indices]
+    total_selected = len(selected_tests)
+
+    await ctx.bot.send_message(
+        chat_id,
+        f"⏳ Starting extraction of *{total_selected}* quiz(zes)…\n"
+        "Each quiz will be sent as a separate JSON file.",
+        parse_mode="Markdown",
+    )
+
+    loop          = asyncio.get_event_loop()
+    success_count = 0
+    fail_count    = 0
+
+    for idx, (orig_num, test) in enumerate(zip(indices, selected_tests), 1):
+        t_name = test.get("title") or test.get("name") or f"ID:{test.get('id','')}"
+
+        progress_msg = await ctx.bot.send_message(
+            chat_id,
+            f"⏳ [{idx}/{total_selected}] Scraping *{t_name}*…",
+            parse_mode="Markdown",
+        )
+
+        try:
+            t_entry = await loop.run_in_executor(
+                None, scraper.scrape_single_test, test
+            )
+        except Exception as e:
+            await ctx.bot.edit_message_text(
+                f"❌ [{idx}/{total_selected}] Failed — *{t_name}*\n`{e}`",
+                chat_id=chat_id,
+                message_id=progress_msg.message_id,
+                parse_mode="Markdown",
+            )
+            fail_count += 1
+            continue
+
+        total_q   = t_entry["total_questions"]
+        output    = {
+            "site":       profile["label"],
+            "fetched_at": datetime.now().isoformat(),
+            "series":     series_name,
+            "test":       t_entry,
+        }
+        json_bytes = json.dumps(output, indent=2, ensure_ascii=False).encode("utf-8")
+        size_kb    = len(json_bytes) / 1024
+        safe_name  = re.sub(r"[^\w\- ]", "_", t_name)[:60]
+        filename   = f"{safe_name}.json"
+
+        await ctx.bot.edit_message_text(
+            f"✅ [{idx}/{total_selected}] *{t_name}*\n"
+            f"❓ {total_q} questions  •  📦 {size_kb:.1f} KB",
+            chat_id=chat_id,
+            message_id=progress_msg.message_id,
+            parse_mode="Markdown",
+        )
+
+        if len(json_bytes) > 50 * 1024 * 1024:
+            await ctx.bot.send_message(
+                chat_id,
+                f"⚠️ *{t_name}* exceeds Telegram's 50 MB limit — skipped.",
+                parse_mode="Markdown",
+            )
+            fail_count += 1
+        else:
+            await ctx.bot.send_document(
+                chat_id=chat_id,
+                document=BytesIO(json_bytes),
+                filename=filename,
+                caption=f"📄 {t_name}\n❓ {total_q} questions",
+            )
+            success_count += 1
+
+    summary = (
+        f"🎉 *All done!*\n"
+        f"✅ Sent: {success_count}/{total_selected}\n"
+    )
+    if fail_count:
+        summary += f"❌ Failed: {fail_count}/{total_selected}\n"
+    summary += "\nUse /sites or /manual to scrape more."
+    await ctx.bot.send_message(chat_id, summary, parse_mode="Markdown")
+
+
 # ─── COMMANDS ─────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -705,6 +806,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "I scrape test series from ClassX-powered sites and send you the JSON.\n\n"
         "*Commands:*\n"
         "• /sites — Pick a site, series and quiz to extract\n"
+        "• /manual — Enter a test series ID directly (skip the series list)\n"
         "• /addapi — Add a new site by pasting its API URL\n"
         "• /listapis — View all saved sites\n"
         "• /deleteapi — Remove a saved site\n"
@@ -717,7 +819,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 *ClassX Scraper Bot — Help*\n\n"
-        "*Scraping flow:*\n"
+        "*Normal scraping flow (/sites):*\n"
         "1️⃣ /sites → numbered list of sites → reply with number\n"
         "2️⃣ Numbered list of test series → reply with number\n"
         "3️⃣ Numbered list of quizzes → reply with selection:\n"
@@ -726,6 +828,11 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "   • Range → `2-6`\n"
         "   • All → `all`\n"
         "4️⃣ Each quiz sent as a separate JSON file ✅\n\n"
+        "*Manual mode (/manual):*\n"
+        "1️⃣ /manual → numbered list of sites → reply with number\n"
+        "2️⃣ Bot asks for a test series ID → type any numeric ID\n"
+        "   (You can enter multiple IDs separated by spaces to batch-fetch)\n"
+        "3️⃣ Same quiz selection flow as above\n\n"
         "*Managing sites:*\n"
         "• /addapi — Paste one URL, done.\n"
         "• /listapis — See all saved sites.\n"
@@ -787,6 +894,41 @@ async def cmd_sites(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ─── /manual COMMAND ──────────────────────────────────────────────────────────
+
+async def cmd_manual(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Manual mode: user picks a site, then types a test series ID directly
+    instead of browsing the series list.
+    """
+    chat_id = update.effective_chat.id
+    user_state.pop(chat_id, None)
+    ctx.user_data.pop("_new_api", None)
+    ctx.user_data.pop("_del_apis", None)
+
+    try:
+        apis = load_all_apis()
+    except Exception as e:
+        await update.message.reply_text(f"❌ MongoDB error: {e}")
+        return
+
+    if not apis:
+        await update.message.reply_text(
+            "No APIs saved yet. Use /addapi to add a ClassX site."
+        )
+        return
+
+    user_state[chat_id] = {"step": "manual_site_select", "apis": apis}
+
+    numbered = build_numbered_list(apis, lambda a: f"*{a['label']}*  (`{a['key']}`)")
+    await send_chunked(
+        update.message,
+        f"🔧 *Manual Mode* — pick a site:\n\n{numbered}\n\n"
+        "Reply with the site number.",
+        parse_mode="Markdown",
+    )
+
+
 async def conv_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("_new_api", None)
     ctx.user_data.pop("_del_apis", None)
@@ -798,6 +940,8 @@ async def conv_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if cmd == "sites":
         return await cmd_sites(update, ctx)
+    if cmd == "manual":
+        return await cmd_manual(update, ctx)
     if cmd == "deleteapi":
         return await cmd_deleteapi(update, ctx)
     if cmd == "addapi":
@@ -818,7 +962,9 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     step = state.get("step")
     text = update.message.text.strip()
 
-    # ── Step 1: select site ───────────────────────────────────────────────────
+    # ── /sites flow ───────────────────────────────────────────────────────────
+
+    # Step 1: select site
     if step == "site_select":
         apis = state["apis"]
         n    = parse_number(text, len(apis))
@@ -869,186 +1015,260 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
 
-    # ── Step 2: select test series ────────────────────────────────────────────
+    # Step 2: select test series
     elif step == "series_select":
-        series_list = state["series_list"]
-        profile     = state["profile"]
-        n           = parse_number(text, len(series_list))
+        await _handle_series_select(update, ctx, chat_id, state, text)
+
+    # Step 3: select quiz(zes) and scrape
+    elif step == "quiz_select":
+        await _handle_quiz_select(update, ctx, chat_id, state, text)
+
+    # ── /manual flow ──────────────────────────────────────────────────────────
+
+    # Manual step 1: select site
+    elif step == "manual_site_select":
+        apis = state["apis"]
+        n    = parse_number(text, len(apis))
         if n is None:
             await update.message.reply_text(
-                f"Please reply with a number between 1 and {len(series_list)}."
+                f"Please reply with a number between 1 and {len(apis)}."
             )
             return
 
-        series = series_list[n - 1]
-        state["series"] = series
-        s_id   = series.get("id") or series.get("series_id") or ""
-        s_name = series.get("title") or series.get("name") or f"Series #{s_id}"
+        profile = apis[n - 1]
+        scraper = ClassXScraper(profile)
+        state["profile"] = profile
+        state["scraper"] = scraper
+        state["step"]    = "manual_series_id"
 
         await update.message.reply_text(
-            f"⏳ Fetching quizzes inside *{s_name}*…",
+            f"✅ Site: *{profile['label']}*\n\n"
+            "🔢 Now enter the *test series ID* (numeric).\n\n"
+            "You can also enter *multiple IDs* separated by spaces to fetch "
+            "quizzes from several series at once:\n"
+            "`123` or `123 456 789`",
             parse_mode="Markdown",
         )
 
-        loop    = asyncio.get_event_loop()
-        scraper = state["scraper"]
+    # Manual step 2: receive series ID(s) and fetch quizzes
+    elif step == "manual_series_id":
+        await _handle_manual_series_id(update, ctx, chat_id, state, text)
 
-        subjects = await loop.run_in_executor(None, scraper.get_subjects, s_id)
+    # Manual step 3: quiz selection (reuses the same handler as /sites)
+    elif step == "manual_quiz_select":
+        await _handle_quiz_select(update, ctx, chat_id, state, text)
+
+
+# ─── SHARED SUB-HANDLERS ──────────────────────────────────────────────────────
+
+async def _handle_series_select(update, ctx, chat_id, state, text):
+    """Handle series selection in the normal /sites flow."""
+    series_list = state["series_list"]
+    profile     = state["profile"]
+    n           = parse_number(text, len(series_list))
+    if n is None:
+        await update.message.reply_text(
+            f"Please reply with a number between 1 and {len(series_list)}."
+        )
+        return
+
+    series = series_list[n - 1]
+    state["series"] = series
+    s_id   = series.get("id") or series.get("series_id") or ""
+    s_name = series.get("title") or series.get("name") or f"Series #{s_id}"
+
+    await update.message.reply_text(
+        f"⏳ Fetching quizzes inside *{s_name}*…",
+        parse_mode="Markdown",
+    )
+
+    loop    = asyncio.get_event_loop()
+    scraper = state["scraper"]
+
+    subjects = await loop.run_in_executor(None, scraper.get_subjects, s_id)
+    if not subjects:
+        subjects = [{"subjectid": 0, "subject_name": "All Tests"}]
+
+    all_tests = []
+    for subj in subjects:
+        subj_id = (subj.get("subjectid") or subj.get("id")
+                   or subj.get("subject_id") or 0)
+        tests = await loop.run_in_executor(
+            None, scraper.get_tests, s_id, subj_id
+        )
+        subj_name = (subj.get("subject_name") or subj.get("name")
+                     or subj.get("title") or "")
+        for t in tests:
+            t["_subject_name"] = subj_name
+        all_tests.extend(tests)
+
+    if not all_tests:
+        await update.message.reply_text(
+            f"⚠️ No quizzes found inside *{s_name}*. Try a different series.",
+            parse_mode="Markdown",
+        )
+        state["step"] = "series_select"
+        return
+
+    state["all_tests"]   = all_tests
+    state["series_name"] = s_name
+    state["step"]        = "quiz_select"
+
+    await _send_quiz_list(update.message, all_tests, s_name)
+
+
+async def _handle_manual_series_id(update, ctx, chat_id, state, text):
+    """
+    Receive one or more space-separated series IDs from the user,
+    fetch quizzes from all of them, and present a combined numbered list.
+    """
+    raw_ids = text.split()
+    # Validate: all tokens must be numeric
+    if not raw_ids or not all(re.fullmatch(r"\d+", sid) for sid in raw_ids):
+        await update.message.reply_text(
+            "⚠️ Please enter one or more *numeric* series IDs separated by spaces.\n"
+            "Example: `123` or `123 456 789`\n\n"
+            "Or /cancel to abort.",
+            parse_mode="Markdown",
+        )
+        return
+
+    profile = state["profile"]
+    scraper = state["scraper"]
+    loop    = asyncio.get_event_loop()
+
+    # Deduplicate while preserving order
+    seen    = set()
+    series_ids = []
+    for sid in raw_ids:
+        if sid not in seen:
+            seen.add(sid)
+            series_ids.append(sid)
+
+    id_display = ", ".join(f"`{sid}`" for sid in series_ids)
+    await update.message.reply_text(
+        f"⏳ Fetching quizzes for series ID(s): {id_display} …",
+        parse_mode="Markdown",
+    )
+
+    all_tests  = []
+    found_ids  = []
+    missed_ids = []
+
+    for sid in series_ids:
+        # Fetch subjects for this series ID
+        subjects = await loop.run_in_executor(None, scraper.get_subjects, sid)
         if not subjects:
             subjects = [{"subjectid": 0, "subject_name": "All Tests"}]
 
-        all_tests = []
+        series_tests = []
         for subj in subjects:
             subj_id = (subj.get("subjectid") or subj.get("id")
                        or subj.get("subject_id") or 0)
             tests = await loop.run_in_executor(
-                None, scraper.get_tests, s_id, subj_id
+                None, scraper.get_tests, sid, subj_id
             )
             subj_name = (subj.get("subject_name") or subj.get("name")
                          or subj.get("title") or "")
             for t in tests:
                 t["_subject_name"] = subj_name
-            all_tests.extend(tests)
+                t["_series_id"]    = sid   # tag so we know which series it came from
+            series_tests.extend(tests)
 
-        if not all_tests:
-            await update.message.reply_text(
-                f"⚠️ No quizzes found inside *{s_name}*. Try a different series.",
-                parse_mode="Markdown",
-            )
-            state["step"] = "series_select"
-            return
+        if series_tests:
+            all_tests.extend(series_tests)
+            found_ids.append(sid)
+        else:
+            missed_ids.append(sid)
 
-        state["all_tests"] = all_tests
-        state["step"]      = "quiz_select"
-
-        def test_label(t):
-            name   = t.get("title") or t.get("name") or f"ID:{t.get('id','')}"
-            subj   = t.get("_subject_name", "")
-            marks  = t.get("marks", "")
-            mins   = t.get("time", "")
-            extras = []
-            if subj:  extras.append(subj)
-            if marks: extras.append(f"{marks} marks")
-            if mins:  extras.append(f"{mins} min")
-            suffix = f"  [{', '.join(extras)}]" if extras else ""
-            return f"{name}{suffix}"
-
-        numbered = build_numbered_list(all_tests, test_label)
-        await send_chunked(
-            update.message,
-            f"📝 *{s_name}* — {len(all_tests)} quiz(zes) found.\n\n"
-            f"{numbered}\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Reply with your selection:\n"
-            f"• Single quiz → `3`\n"
-            f"• Multiple → `1&3&5`\n"
-            f"• Range → `2-6`\n"
-            f"• Everything → `all`",
-            parse_mode="Markdown",
-        )
-
-    # ── Step 3: select quiz(zes) and scrape ───────────────────────────────────
-    elif step == "quiz_select":
-        all_tests = state["all_tests"]
-        profile   = state["profile"]
-        series    = state["series"]
-        scraper   = state["scraper"]
-        s_name    = series.get("title") or series.get("name") or ""
-
-        indices = parse_multi_selection(text, len(all_tests))
-        if indices is None:
-            await update.message.reply_text(
-                f"⚠️ Invalid selection. Examples:\n"
-                f"• Single: `3`\n"
-                f"• Multiple: `1&3&5`\n"
-                f"• Range: `2-6`\n"
-                f"• All: `all`\n\n"
-                f"Numbers must be between 1 and {len(all_tests)}.",
-                parse_mode="Markdown",
-            )
-            return
-
-        selected_tests = [all_tests[i - 1] for i in indices]
-        total_selected = len(selected_tests)
-        user_state.pop(chat_id, None)
-
+    if not all_tests:
+        ids_str = ", ".join(series_ids)
         await update.message.reply_text(
-            f"⏳ Starting extraction of *{total_selected}* quiz(zes)…\n"
-            "Each quiz will be sent as a separate JSON file.",
+            f"❌ No quizzes found for series ID(s): {ids_str}\n\n"
+            "Check the IDs and try again, or /cancel.",
+        )
+        # Stay in the same step so the user can retry
+        return
+
+    # Build a human-readable series name for the output JSON
+    if len(found_ids) == 1:
+        series_name = f"Manual Series #{found_ids[0]}"
+    else:
+        series_name = "Manual Series #" + "+".join(found_ids)
+
+    state["all_tests"]   = all_tests
+    state["series_name"] = series_name
+    state["step"]        = "manual_quiz_select"
+
+    # Warn about any IDs that returned nothing
+    if missed_ids:
+        await update.message.reply_text(
+            f"⚠️ No quizzes found for series ID(s): {', '.join(missed_ids)} — skipped.",
+        )
+
+    await _send_quiz_list(update.message, all_tests, series_name)
+
+
+async def _send_quiz_list(message, all_tests: list, series_name: str):
+    """Send the numbered quiz list and selection instructions."""
+    def test_label(t):
+        name   = t.get("title") or t.get("name") or f"ID:{t.get('id','')}"
+        subj   = t.get("_subject_name", "")
+        sid    = t.get("_series_id", "")    # shown in manual mode
+        marks  = t.get("marks", "")
+        mins   = t.get("time", "")
+        extras = []
+        if sid:   extras.append(f"series {sid}")
+        if subj:  extras.append(subj)
+        if marks: extras.append(f"{marks} marks")
+        if mins:  extras.append(f"{mins} min")
+        suffix = f"  [{', '.join(extras)}]" if extras else ""
+        return f"{name}{suffix}"
+
+    numbered = build_numbered_list(all_tests, test_label)
+    await send_chunked(
+        message,
+        f"📝 *{series_name}* — {len(all_tests)} quiz(zes) found.\n\n"
+        f"{numbered}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Reply with your selection:\n"
+        f"• Single quiz → `3`\n"
+        f"• Multiple → `1&3&5`\n"
+        f"• Range → `2-6`\n"
+        f"• Everything → `all`",
+        parse_mode="Markdown",
+    )
+
+
+async def _handle_quiz_select(update, ctx, chat_id, state, text):
+    """Handle quiz selection and kick off scraping (shared by /sites and /manual)."""
+    all_tests   = state["all_tests"]
+    profile     = state["profile"]
+    series_name = state.get("series_name") or (
+        state.get("series", {}).get("title")
+        or state.get("series", {}).get("name", "")
+    )
+    scraper     = state["scraper"]
+
+    indices = parse_multi_selection(text, len(all_tests))
+    if indices is None:
+        await update.message.reply_text(
+            f"⚠️ Invalid selection. Examples:\n"
+            f"• Single: `3`\n"
+            f"• Multiple: `1&3&5`\n"
+            f"• Range: `2-6`\n"
+            f"• All: `all`\n\n"
+            f"Numbers must be between 1 and {len(all_tests)}.",
             parse_mode="Markdown",
         )
+        return
 
-        loop          = asyncio.get_event_loop()
-        success_count = 0
-        fail_count    = 0
+    user_state.pop(chat_id, None)
 
-        for idx, (orig_num, test) in enumerate(zip(indices, selected_tests), 1):
-            t_name = test.get("title") or test.get("name") or f"ID:{test.get('id','')}"
-
-            progress_msg = await ctx.bot.send_message(
-                chat_id,
-                f"⏳ [{idx}/{total_selected}] Scraping *{t_name}*…",
-                parse_mode="Markdown",
-            )
-
-            try:
-                t_entry = await loop.run_in_executor(
-                    None, scraper.scrape_single_test, test
-                )
-            except Exception as e:
-                await ctx.bot.edit_message_text(
-                    f"❌ [{idx}/{total_selected}] Failed — *{t_name}*\n`{e}`",
-                    chat_id=chat_id,
-                    message_id=progress_msg.message_id,
-                    parse_mode="Markdown",
-                )
-                fail_count += 1
-                continue
-
-            total_q   = t_entry["total_questions"]
-            output    = {
-                "site":       profile["label"],
-                "fetched_at": datetime.now().isoformat(),
-                "series":     s_name,
-                "test":       t_entry,
-            }
-            json_bytes = json.dumps(output, indent=2, ensure_ascii=False).encode("utf-8")
-            size_kb    = len(json_bytes) / 1024
-            safe_name  = re.sub(r"[^\w\- ]", "_", t_name)[:60]
-            filename   = f"{safe_name}.json"
-
-            await ctx.bot.edit_message_text(
-                f"✅ [{idx}/{total_selected}] *{t_name}*\n"
-                f"❓ {total_q} questions  •  📦 {size_kb:.1f} KB",
-                chat_id=chat_id,
-                message_id=progress_msg.message_id,
-                parse_mode="Markdown",
-            )
-
-            if len(json_bytes) > 50 * 1024 * 1024:
-                await ctx.bot.send_message(
-                    chat_id,
-                    f"⚠️ *{t_name}* exceeds Telegram's 50 MB limit — skipped.",
-                    parse_mode="Markdown",
-                )
-                fail_count += 1
-            else:
-                await ctx.bot.send_document(
-                    chat_id=chat_id,
-                    document=BytesIO(json_bytes),
-                    filename=filename,
-                    caption=f"📄 {t_name}\n❓ {total_q} questions",
-                )
-                success_count += 1
-
-        summary = (
-            f"🎉 *All done!*\n"
-            f"✅ Sent: {success_count}/{total_selected}\n"
-        )
-        if fail_count:
-            summary += f"❌ Failed: {fail_count}/{total_selected}\n"
-        summary += "\nUse /sites to scrape more."
-        await ctx.bot.send_message(chat_id, summary, parse_mode="Markdown")
+    await run_quiz_scrape(
+        update, ctx,
+        chat_id, all_tests, profile, series_name, scraper, indices,
+    )
 
 
 # ─── HEALTH SERVER + SELF-PING ────────────────────────────────────────────────
@@ -1108,6 +1328,7 @@ async def main():
         fallbacks=[
             CommandHandler("cancel",    conv_cancel),
             CommandHandler("sites",     conv_cancel),
+            CommandHandler("manual",    conv_cancel),
             CommandHandler("deleteapi", conv_cancel),
         ],
     )
@@ -1121,6 +1342,7 @@ async def main():
         fallbacks=[
             CommandHandler("cancel",  conv_cancel),
             CommandHandler("sites",   conv_cancel),
+            CommandHandler("manual",  conv_cancel),
             CommandHandler("addapi",  conv_cancel),
         ],
     )
@@ -1129,6 +1351,7 @@ async def main():
     app.add_handler(CommandHandler("help",     cmd_help))
     app.add_handler(CommandHandler("listapis", cmd_listapis))
     app.add_handler(CommandHandler("sites",    cmd_sites))
+    app.add_handler(CommandHandler("manual",   cmd_manual))
     app.add_handler(CommandHandler("cancel",   conv_cancel))
     app.add_handler(add_conv)
     app.add_handler(del_conv)
