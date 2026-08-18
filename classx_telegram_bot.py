@@ -21,10 +21,12 @@ NEW in v2:
   • /manual command  — skip the series list; enter a test series ID directly.
       /manual → numbered list of sites → reply with number
               → bot asks for test series ID → user types the ID
-              → bot fetches quizzes for that series ID → same quiz selection flow
+              → bot fetches SUBJECTS/TOPICS (Geography, Physics, etc.)
+              → user picks one or more subjects ("1", "1&3", "all")
+              → bot fetches quizzes for selected subjects → same quiz selection flow
                   "3" / "1&3&5" / "2-6" / "all"
               → bot scrapes and sends JSON files
-              (now shows the REAL series name, not just "Manual Series #ID")
+              (shows the REAL series name, not just "Manual Series #ID")
 
   • /search command  — probe a range of series IDs and show which ones exist.
       /search → numbered list of sites → reply with number
@@ -910,8 +912,10 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "1️⃣ /manual → numbered list of sites → reply with number\n"
         "2️⃣ Bot asks for a test series ID → type any numeric ID\n"
         "   (You can enter multiple IDs separated by spaces to batch-fetch)\n"
-        "3️⃣ Bot resolves the real series name from the API ✅\n"
-        "4️⃣ Same quiz selection flow as above\n\n"
+        "3️⃣ Bot shows subjects/topics (Geography, Physics, etc.)\n"
+        "   Select: `1` / `1&3` / `2-4` / `all`\n"
+        "4️⃣ Bot shows quizzes for selected subjects → same selection flow\n"
+        "5️⃣ Each quiz sent as a separate JSON file ✅\n\n"
         "*Search / discover mode (/search):*\n"
         "1️⃣ /search → pick a site\n"
         "2️⃣ Enter an ID range → `100-150`  (max 200 IDs)\n"
@@ -1176,11 +1180,15 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
 
-    # Manual step 2: receive series ID(s), resolve real names, fetch quizzes
+    # Manual step 2: receive series ID(s), resolve real names, fetch subjects
     elif step == "manual_series_id":
         await _handle_manual_series_id(update, ctx, chat_id, state, text)
 
-    # Manual step 3: quiz selection (reuses the same handler as /sites)
+    # Manual step 3: user picks which subject(s)/topic(s) to fetch quizzes from
+    elif step == "manual_subject_select":
+        await _handle_manual_subject_select(update, ctx, chat_id, state, text)
+
+    # Manual step 4: quiz selection (reuses the same handler as /sites)
     elif step == "manual_quiz_select":
         await _handle_quiz_select(update, ctx, chat_id, state, text)
 
@@ -1278,10 +1286,10 @@ async def _handle_series_select(update, ctx, chat_id, state, text):
 
 async def _handle_manual_series_id(update, ctx, chat_id, state, text):
     """
-    Receive one or more space-separated series IDs from the user,
-    fetch quizzes from all of them, resolve the REAL series name for each ID
-    from the API (instead of using a generic 'Manual Series #ID' label),
-    and present a combined numbered quiz list.
+    Receive one or more space-separated series IDs, resolve their real names,
+    fetch the list of subjects/topics for each, then present a combined
+    numbered subject list so the user can pick which topic(s) to drill into.
+    Quizzes are NOT fetched yet — that happens after subject selection.
     """
     raw_ids = text.split()
 
@@ -1309,91 +1317,65 @@ async def _handle_manual_series_id(update, ctx, chat_id, state, text):
 
     id_display = ", ".join(f"`{sid}`" for sid in series_ids)
     await update.message.reply_text(
-        f"⏳ Fetching quizzes for series ID(s): {id_display} …",
+        f"⏳ Fetching subjects/topics for series ID(s): {id_display} …",
         parse_mode="Markdown",
     )
 
-    all_tests    = []
-    found_ids    = []
-    missed_ids   = []
-    # Map series_id → resolved real name
+    # ── Fetch subjects for every series ID ───────────────────────────────────
+    all_subjects  = []   # list of dicts, each tagged with _series_id & _series_name
+    found_ids     = []
+    missed_ids    = []
     series_names: dict = {}
 
     for sid in series_ids:
-        # Fetch subjects for this series ID
         subjects = await loop.run_in_executor(None, scraper.get_subjects, sid)
-        if not subjects:
-            subjects = [{"subjectid": 0, "subject_name": "All Tests"}]
 
-        series_tests = []
-        for subj in subjects:
-            subj_id = (subj.get("subjectid") or subj.get("id")
-                       or subj.get("subject_id") or 0)
-            tests = await loop.run_in_executor(
-                None, scraper.get_tests, sid, subj_id
-            )
-            subj_name = (subj.get("subject_name") or subj.get("name")
-                         or subj.get("title") or "")
-            for t in tests:
-                t["_subject_name"] = subj_name
-                t["_series_id"]    = sid
-            series_tests.extend(tests)
-
-        if series_tests:
-            all_tests.extend(series_tests)
-            found_ids.append(sid)
-
-            # ── Resolve the real series name ──────────────────────────────────
-            # Priority 1: read from the first test's own metadata fields
-            #   (some ClassX APIs embed the series name inside each test object)
-            first_test = series_tests[0]
-            real_name  = (
-                first_test.get("test_series_name")
-                or first_test.get("series_name")
-                or first_test.get("series_title")
-                or first_test.get("testseries_name")
+        # Resolve real series name
+        real_name = ""
+        if subjects:
+            first = subjects[0]
+            real_name = (
+                first.get("test_series_name")
+                or first.get("series_name")
+                or first.get("series_title")
+                or first.get("testseries_name")
                 or ""
             )
+        if not real_name:
+            real_name = await loop.run_in_executor(
+                None, scraper.get_series_name_by_id, sid
+            )
+        series_names[sid] = real_name or f"Series #{sid}"
 
-            # Priority 2: search the full series list via the API
-            if not real_name:
-                real_name = await loop.run_in_executor(
-                    None, scraper.get_series_name_by_id, sid
-                )
-
-            series_names[sid] = real_name or f"Series #{sid}"
+        if subjects:
+            for subj in subjects:
+                subj["_series_id"]   = sid
+                subj["_series_name"] = series_names[sid]
+            all_subjects.extend(subjects)
+            found_ids.append(sid)
         else:
-            missed_ids.append(sid)
+            # No subjects returned — treat the whole series as one "All Tests" bucket
+            all_subjects.append({
+                "subjectid":    0,
+                "subject_name": "All Tests",
+                "_series_id":   sid,
+                "_series_name": series_names[sid],
+            })
+            found_ids.append(sid)
 
-    if not all_tests:
-        ids_str = ", ".join(series_ids)
+    if not found_ids:
         await update.message.reply_text(
-            f"❌ No quizzes found for series ID(s): {ids_str}\n\n"
+            f"❌ Could not reach any of the series IDs: {', '.join(series_ids)}\n\n"
             "Check the IDs and try again, or /cancel.",
         )
-        # Stay in the same step so the user can retry
         return
 
-    # Build a human-readable combined series name for the output JSON
-    if len(found_ids) == 1:
-        series_name = series_names[found_ids[0]]
-    else:
-        # Multiple IDs: join individual names
-        parts = [series_names.get(sid, f"Series #{sid}") for sid in found_ids]
-        series_name = " + ".join(parts)
-
-    state["all_tests"]    = all_tests
-    state["series_name"]  = series_name
-    state["series_names"] = series_names  # keep per-ID names for per-test JSON
-    state["step"]         = "manual_quiz_select"
-
-    # Warn about any IDs that returned nothing
     if missed_ids:
         await update.message.reply_text(
-            f"⚠️ No quizzes found for series ID(s): {', '.join(missed_ids)} — skipped.",
+            f"⚠️ No subjects found for series ID(s): {', '.join(missed_ids)} — skipped.",
         )
 
-    # Show which real names were resolved
+    # Show resolved names when multiple IDs were entered
     if len(found_ids) > 1:
         name_lines = "\n".join(
             f"• ID `{sid}` → *{series_names.get(sid, sid)}*"
@@ -1403,6 +1385,126 @@ async def _handle_manual_series_id(update, ctx, chat_id, state, text):
             f"✅ Resolved series names:\n{name_lines}",
             parse_mode="Markdown",
         )
+
+    # Store everything in state — quizzes will be fetched after subject choice
+    state["all_subjects"] = all_subjects
+    state["series_names"] = series_names
+    state["series_ids"]   = found_ids
+
+    # Build combined series name for display / JSON output
+    if len(found_ids) == 1:
+        state["series_name"] = series_names[found_ids[0]]
+    else:
+        state["series_name"] = " + ".join(
+            series_names.get(sid, f"Series #{sid}") for sid in found_ids
+        )
+
+    state["step"] = "manual_subject_select"
+
+    await _send_subject_list(update.message, all_subjects, state["series_name"])
+
+
+async def _send_subject_list(message, all_subjects: list, series_name: str):
+    """Send a numbered list of subjects/topics for the user to choose from."""
+    def subj_label(s):
+        name   = (s.get("subject_name") or s.get("name") or s.get("title")
+                  or f"Subject #{s.get('subjectid') or s.get('id') or '?'}")
+        sid    = s.get("_series_id", "")
+        extras = []
+        if sid:
+            extras.append(f"series {sid}")
+        suffix = f"  [{', '.join(extras)}]" if extras else ""
+        return f"{name}{suffix}"
+
+    numbered = build_numbered_list(all_subjects, subj_label)
+    await send_chunked(
+        message,
+        f"📚 *{series_name}*\n\n"
+        f"Found *{len(all_subjects)}* subject(s)/topic(s).\n"
+        f"Select which one(s) you want to fetch quizzes from:\n\n"
+        f"{numbered}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Reply with your selection:\n"
+        f"• Single subject → `2`\n"
+        f"• Multiple → `1&3&5`\n"
+        f"• Range → `2-4`\n"
+        f"• All subjects → `all`",
+        parse_mode="Markdown",
+    )
+
+
+async def _handle_manual_subject_select(update, ctx, chat_id, state, text):
+    """
+    Parse the user's subject selection, fetch quizzes for the chosen
+    subjects, then advance to the quiz selection step.
+    """
+    all_subjects = state["all_subjects"]
+    profile      = state["profile"]
+    scraper      = state["scraper"]
+    series_name  = state["series_name"]
+    loop         = asyncio.get_event_loop()
+
+    indices = parse_multi_selection(text, len(all_subjects))
+    if indices is None:
+        await update.message.reply_text(
+            f"⚠️ Invalid selection. Examples:\n"
+            f"• Single: `2`\n"
+            f"• Multiple: `1&3&5`\n"
+            f"• Range: `2-4`\n"
+            f"• All: `all`\n\n"
+            f"Numbers must be between 1 and {len(all_subjects)}.",
+            parse_mode="Markdown",
+        )
+        return
+
+    chosen_subjects = [all_subjects[i - 1] for i in indices]
+    chosen_names    = [
+        subj.get("subject_name") or subj.get("name") or subj.get("title") or "?"
+        for subj in chosen_subjects
+    ]
+
+    await update.message.reply_text(
+        f"⏳ Fetching quizzes for: *{', '.join(chosen_names)}* …",
+        parse_mode="Markdown",
+    )
+
+    all_tests  = []
+    no_quiz    = []
+
+    for subj in chosen_subjects:
+        sid     = subj.get("_series_id", "")
+        subj_id = (subj.get("subjectid") or subj.get("id")
+                   or subj.get("subject_id") or 0)
+        subj_name = (subj.get("subject_name") or subj.get("name")
+                     or subj.get("title") or "")
+
+        tests = await loop.run_in_executor(
+            None, scraper.get_tests, sid, subj_id
+        )
+        if tests:
+            for t in tests:
+                t["_subject_name"] = subj_name
+                t["_series_id"]    = sid
+            all_tests.extend(tests)
+        else:
+            no_quiz.append(subj_name)
+
+    if no_quiz:
+        await update.message.reply_text(
+            f"⚠️ No quizzes found in: {', '.join(no_quiz)} — skipped.",
+        )
+
+    if not all_tests:
+        await update.message.reply_text(
+            "❌ No quizzes found for the selected subject(s).\n"
+            "Try a different subject or /cancel.",
+        )
+        # Go back to subject selection so the user can retry
+        await _send_subject_list(update.message, all_subjects, series_name)
+        return
+
+    state["all_tests"] = all_tests
+    state["step"]      = "manual_quiz_select"
 
     await _send_quiz_list(update.message, all_tests, series_name)
 
