@@ -25,6 +25,13 @@ NEW in v2:
                   "3" / "1&3&5" / "2-6" / "all"
               → bot scrapes and sends JSON files
 
+  • /search command  — probe a range of series IDs and show which ones exist.
+      /search → numbered list of sites → reply with number
+              → bot asks for an ID range, e.g. "100-150"  (max 200 IDs at once)
+              → bot silently probes every ID in that range
+              → sends a summary table: found IDs with quiz counts & series name
+              → user can then use /manual with any of those IDs to scrape them
+
 INSTALL:
   pip install python-telegram-bot pymongo requests aiohttp
 
@@ -43,6 +50,7 @@ COMMANDS:
   /help         — Full help text
   /sites        — Pick a site (numbered list)
   /manual       — Enter a test series ID manually (skip series list)
+  /search       — Probe a range of series IDs to discover what exists
   /addapi       — Paste a ClassX API URL to add it (1 step)
   /listapis     — Show all saved APIs
   /deleteapi    — Delete an API by number
@@ -624,6 +632,42 @@ class ClassXScraper:
                             opt["image"] = ho[i].get("image", "")
         return qs
 
+    def probe_series_id(self, series_id: str) -> dict | None:
+        """
+        Lightweight probe: fetch subjects + test titles for a given series ID.
+        Returns a dict  {"id": series_id, "quiz_count": N, "subjects": [...],
+                         "sample_names": [...up to 3 quiz titles...]}
+        or None if the series ID yields nothing.
+        Does NOT fetch questions — purely for discovery.
+        """
+        subjects = self.get_subjects(series_id)
+        if not subjects:
+            subjects = [{"subjectid": 0, "subject_name": "All Tests"}]
+
+        total_tests  = 0
+        sample_names = []
+
+        for subj in subjects:
+            subj_id = (subj.get("subjectid") or subj.get("id")
+                       or subj.get("subject_id") or 0)
+            tests = self.get_tests(series_id, subj_id)
+            total_tests += len(tests)
+            for t in tests:
+                name = t.get("title") or t.get("name") or ""
+                if name and len(sample_names) < 3:
+                    sample_names.append(name)
+            if self.cancelled:
+                break
+
+        if total_tests == 0:
+            return None
+
+        return {
+            "id":           series_id,
+            "quiz_count":   total_tests,
+            "sample_names": sample_names,
+        }
+
     def scrape_single_test(self, test: dict) -> dict:
         t_id   = test.get("id") or test.get("test_id") or ""
         t_name = test.get("title") or test.get("name") or f"Test #{t_id}"
@@ -807,6 +851,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "*Commands:*\n"
         "• /sites — Pick a site, series and quiz to extract\n"
         "• /manual — Enter a test series ID directly (skip the series list)\n"
+        "• /search — Probe a range of IDs to discover what series exist\n"
         "• /addapi — Add a new site by pasting its API URL\n"
         "• /listapis — View all saved sites\n"
         "• /deleteapi — Remove a saved site\n"
@@ -833,6 +878,12 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "2️⃣ Bot asks for a test series ID → type any numeric ID\n"
         "   (You can enter multiple IDs separated by spaces to batch-fetch)\n"
         "3️⃣ Same quiz selection flow as above\n\n"
+        "*Search / discover mode (/search):*\n"
+        "1️⃣ /search → pick a site\n"
+        "2️⃣ Enter an ID range → `100-150`  (max 200 IDs)\n"
+        "3️⃣ Bot probes every ID and shows a table:\n"
+        "   `ID | Quiz count | Sample names`\n"
+        "4️⃣ Use /manual with any discovered ID to scrape it\n\n"
         "*Managing sites:*\n"
         "• /addapi — Paste one URL, done.\n"
         "• /listapis — See all saved sites.\n"
@@ -929,6 +980,45 @@ async def cmd_manual(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ─── /search COMMAND ──────────────────────────────────────────────────────────
+
+SEARCH_MAX_RANGE = 200   # hard cap so no one accidentally fires 10 000 requests
+
+async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Discovery mode: ask user for a site + an ID range, probe every ID in that
+    range, and report back which series IDs exist along with their quiz count
+    and a few sample quiz names.
+    """
+    chat_id = update.effective_chat.id
+    user_state.pop(chat_id, None)
+    ctx.user_data.pop("_new_api", None)
+    ctx.user_data.pop("_del_apis", None)
+
+    try:
+        apis = load_all_apis()
+    except Exception as e:
+        await update.message.reply_text(f"❌ MongoDB error: {e}")
+        return
+
+    if not apis:
+        await update.message.reply_text(
+            "No APIs saved yet. Use /addapi to add a ClassX site."
+        )
+        return
+
+    user_state[chat_id] = {"step": "search_site_select", "apis": apis}
+
+    numbered = build_numbered_list(apis, lambda a: f"*{a['label']}*  (`{a['key']}`)")
+    await send_chunked(
+        update.message,
+        f"🔍 *Search / Discover Series IDs*\n\n"
+        f"Pick a site first:\n\n{numbered}\n\n"
+        "Reply with the site number.",
+        parse_mode="Markdown",
+    )
+
+
 async def conv_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("_new_api", None)
     ctx.user_data.pop("_del_apis", None)
@@ -942,6 +1032,8 @@ async def conv_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await cmd_sites(update, ctx)
     if cmd == "manual":
         return await cmd_manual(update, ctx)
+    if cmd == "search":
+        return await cmd_search(update, ctx)
     if cmd == "deleteapi":
         return await cmd_deleteapi(update, ctx)
     if cmd == "addapi":
@@ -1057,6 +1149,39 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Manual step 3: quiz selection (reuses the same handler as /sites)
     elif step == "manual_quiz_select":
         await _handle_quiz_select(update, ctx, chat_id, state, text)
+
+    # ── /search flow ──────────────────────────────────────────────────────────
+
+    # Search step 1: select site
+    elif step == "search_site_select":
+        apis = state["apis"]
+        n    = parse_number(text, len(apis))
+        if n is None:
+            await update.message.reply_text(
+                f"Please reply with a number between 1 and {len(apis)}."
+            )
+            return
+
+        profile = apis[n - 1]
+        scraper = ClassXScraper(profile)
+        state["profile"] = profile
+        state["scraper"] = scraper
+        state["step"]    = "search_range_input"
+
+        await update.message.reply_text(
+            f"✅ Site: *{profile['label']}*\n\n"
+            f"🔢 Enter the *ID range* to probe:\n\n"
+            f"`100-150`  — probe IDs 100 through 150\n"
+            f"`500-520`  — probe IDs 500 through 520\n\n"
+            f"⚠️ Max {SEARCH_MAX_RANGE} IDs per search.\n"
+            f"Each ID takes ~0.5 s, so 100 IDs ≈ 1 min.\n\n"
+            f"Or /cancel to abort.",
+            parse_mode="Markdown",
+        )
+
+    # Search step 2: receive range and probe
+    elif step == "search_range_input":
+        await _handle_search_range(update, ctx, chat_id, state, text)
 
 
 # ─── SHARED SUB-HANDLERS ──────────────────────────────────────────────────────
@@ -1271,6 +1396,113 @@ async def _handle_quiz_select(update, ctx, chat_id, state, text):
     )
 
 
+async def _handle_search_range(update, ctx, chat_id, state, text):
+    """
+    Parse a range like '100-150', probe every ID, and report what was found.
+    Sends a live progress message that is edited as IDs are checked, then
+    sends the final results table.
+    """
+    profile = state["profile"]
+    scraper = state["scraper"]
+
+    # ── Parse the range ───────────────────────────────────────────────────────
+    m = re.fullmatch(r"(\d+)\s*[-–]\s*(\d+)", text.strip())
+    if not m:
+        await update.message.reply_text(
+            "⚠️ Please enter a range like `100-150`.\n"
+            "Or /cancel to abort.",
+            parse_mode="Markdown",
+        )
+        return
+
+    lo, hi = int(m.group(1)), int(m.group(2))
+    if lo > hi:
+        lo, hi = hi, lo          # swap silently
+
+    total = hi - lo + 1
+    if total > SEARCH_MAX_RANGE:
+        await update.message.reply_text(
+            f"⚠️ That range has *{total}* IDs — the limit is *{SEARCH_MAX_RANGE}*.\n"
+            f"Please use a smaller range, e.g. `{lo}-{lo + SEARCH_MAX_RANGE - 1}`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # ── Clear state now so /cancel doesn't interfere mid-search ──────────────
+    user_state.pop(chat_id, None)
+
+    # ── Live progress message ─────────────────────────────────────────────────
+    progress_msg = await update.message.reply_text(
+        f"🔍 Probing IDs *{lo}* → *{hi}* on *{profile['label']}*…\n"
+        f"0 / {total} checked  •  0 found",
+        parse_mode="Markdown",
+    )
+
+    loop        = asyncio.get_event_loop()
+    found       = []          # list of probe result dicts
+    checked     = 0
+    EDIT_EVERY  = 10          # edit the progress message every N IDs
+
+    for sid_int in range(lo, hi + 1):
+        sid    = str(sid_int)
+        result = await loop.run_in_executor(None, scraper.probe_series_id, sid)
+        checked += 1
+
+        if result:
+            found.append(result)
+
+        # Update progress periodically so the user sees live feedback
+        if checked % EDIT_EVERY == 0 or checked == total:
+            try:
+                await ctx.bot.edit_message_text(
+                    f"🔍 Probing IDs *{lo}* → *{hi}* on *{profile['label']}*…\n"
+                    f"{checked} / {total} checked  •  {len(found)} found",
+                    chat_id=chat_id,
+                    message_id=progress_msg.message_id,
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass   # ignore edit failures (rate-limit, no change, etc.)
+
+    # ── Final results ─────────────────────────────────────────────────────────
+    if not found:
+        await ctx.bot.send_message(
+            chat_id,
+            f"😕 No series found in the range *{lo}–{hi}* on *{profile['label']}*.\n\n"
+            "Try a different range or use /sites to browse the full list.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Build results table
+    lines = [
+        f"✅ *Search complete — {len(found)} series found in range {lo}–{hi}*",
+        f"Site: *{profile['label']}*\n",
+        "```",
+        f"{'ID':<8} {'Quizzes':<9} Sample quiz names",
+        "─" * 60,
+    ]
+    for r in found:
+        sid        = r["id"]
+        qcount     = r["quiz_count"]
+        samples    = r["sample_names"]
+        # Truncate long names so the table stays readable
+        sample_str = " / ".join(s[:35] + "…" if len(s) > 35 else s
+                                for s in samples[:2])
+        lines.append(f"{sid:<8} {qcount:<9} {sample_str}")
+    lines.append("```")
+
+    # Collect just the IDs for a quick-copy hint
+    id_list = " ".join(r["id"] for r in found)
+    lines.append(
+        f"\n💡 Use `/manual` and paste any of these IDs to scrape them:\n"
+        f"`{id_list}`"
+    )
+
+    for chunk in chunk_message("\n".join(lines), 4000):
+        await ctx.bot.send_message(chat_id, chunk, parse_mode="Markdown")
+
+
 # ─── HEALTH SERVER + SELF-PING ────────────────────────────────────────────────
 
 async def health_handler(request: web.Request) -> web.Response:
@@ -1329,6 +1561,7 @@ async def main():
             CommandHandler("cancel",    conv_cancel),
             CommandHandler("sites",     conv_cancel),
             CommandHandler("manual",    conv_cancel),
+            CommandHandler("search",    conv_cancel),
             CommandHandler("deleteapi", conv_cancel),
         ],
     )
@@ -1343,6 +1576,7 @@ async def main():
             CommandHandler("cancel",  conv_cancel),
             CommandHandler("sites",   conv_cancel),
             CommandHandler("manual",  conv_cancel),
+            CommandHandler("search",  conv_cancel),
             CommandHandler("addapi",  conv_cancel),
         ],
     )
@@ -1352,6 +1586,7 @@ async def main():
     app.add_handler(CommandHandler("listapis", cmd_listapis))
     app.add_handler(CommandHandler("sites",    cmd_sites))
     app.add_handler(CommandHandler("manual",   cmd_manual))
+    app.add_handler(CommandHandler("search",   cmd_search))
     app.add_handler(CommandHandler("cancel",   conv_cancel))
     app.add_handler(add_conv)
     app.add_handler(del_conv)
